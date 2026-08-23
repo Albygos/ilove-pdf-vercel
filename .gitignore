@@ -3,6 +3,7 @@ __pycache__/
 .env
 uploads/
 processed/
+sitemaps/
+home ui/
 .DS_Store
 scratch_*
-

@@ -2,6 +2,9 @@
 .gitignore
 uploads/
 processed/
+sitemaps/
+"home ui"/
+home ui/
 *.log
 __pycache__/
 .pytest_cache/

@@ -6,7 +6,7 @@ import shutil
 import io
 import threading
 import re
-from flask import Flask, request, jsonify, send_file, send_from_directory, redirect, abort
+from flask import Flask, request, jsonify, send_file, send_from_directory, redirect, abort, Response
 from pypdf import PdfReader, PdfWriter
 import fitz  # PyMuPDF
 from PIL import Image
@@ -1250,7 +1250,28 @@ def serve_sitemap(suffix=None):
 
 @app.route('/sitemaps/<path:filename>')
 def serve_sitemaps_folder(filename):
-    return send_from_directory(os.path.join(BASE_DIR, 'sitemaps'), filename, mimetype='application/xml')
+    sitemaps_dir = os.path.join(BASE_DIR, 'sitemaps')
+    file_path = os.path.join(sitemaps_dir, filename)
+    if os.path.exists(file_path):
+        return send_from_directory(sitemaps_dir, filename, mimetype='application/xml')
+
+    # Fast dynamic sitemap generation (saves ~486MB disk/bundle size)
+    if filename.startswith('sitemap-articles-') and filename.endswith('.xml'):
+        lang_key = filename[len('sitemap-articles-'):-len('.xml')]
+        today = time.strftime('%Y-%m-%d')
+        domain = "https://ilovespdfs.in"
+        xml_parts = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        ]
+        sorted_kw = sorted(SEO_KEYWORDS) if SEO_KEYWORDS else []
+        lang_prefix = f"/{lang_key}" if lang_key != 'en' else "/en"
+        for kw in sorted_kw:
+            xml_parts.append(f'  <url>\n    <loc>{domain}{lang_prefix}/{kw}</loc>\n    <lastmod>{today}</lastmod>\n    <changefreq>weekly</changefreq>\n    <priority>0.8</priority>\n  </url>')
+        xml_parts.append('</urlset>')
+        return Response("\n".join(xml_parts), mimetype='application/xml')
+
+    return "Sitemap not found.", 404
 
 
 @app.after_request
