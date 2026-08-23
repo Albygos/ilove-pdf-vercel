@@ -1426,3 +1426,191 @@ footer {
         font-size: 1.7rem !important;
     }
 }
+
+/* --- Enhanced Merge PDF Workspace UI --- */
+.dropzone-btn-primary {
+    background-color: var(--primary);
+    color: #ffffff;
+    font-size: 1.15rem;
+    font-weight: 700;
+    padding: 16px 36px;
+    border-radius: var(--radius);
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    box-shadow: 0 8px 16px -2px rgba(229, 62, 62, 0.35);
+    transition: var(--transition);
+    cursor: pointer;
+}
+
+.dropzone-btn-primary:hover {
+    background-color: var(--primary-hover);
+    transform: translateY(-2px);
+    box-shadow: 0 12px 20px -2px rgba(229, 62, 62, 0.45);
+}
+
+.workspace-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    background-color: var(--bg-main);
+    padding: 14px 20px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    margin-bottom: 20px;
+}
+
+.workspace-summary-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-main);
+}
+
+.workspace-summary-badge span {
+    background-color: var(--primary-light);
+    color: var(--primary);
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
+.toolbar-actions-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.btn-tool-sm {
+    background-color: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-main);
+    font-size: 0.85rem;
+    font-weight: 600;
+    padding: 8px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: var(--transition);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.btn-tool-sm:hover {
+    border-color: var(--primary);
+    color: var(--primary);
+    background-color: var(--primary-light);
+}
+
+.btn-tool-add {
+    background-color: var(--primary);
+    color: #ffffff;
+    border-color: var(--primary);
+}
+
+.btn-tool-add:hover {
+    background-color: var(--primary-hover);
+    color: #ffffff;
+}
+
+.pages-grid-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 20px;
+    padding: 10px;
+    min-height: 200px;
+}
+
+.page-thumbnail-card {
+    background-color: var(--bg-card);
+    border: 2px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+    box-shadow: var(--shadow-sm);
+    transition: var(--transition);
+    cursor: grab;
+}
+
+.page-thumbnail-card:hover {
+    border-color: var(--primary);
+    box-shadow: var(--shadow-md);
+    transform: translateY(-2px);
+}
+
+.page-thumbnail-card.dragging {
+    opacity: 0.4;
+    border-style: dashed;
+    border-color: var(--primary);
+}
+
+.page-thumbnail-card.drag-over {
+    border-color: var(--primary);
+    background-color: var(--primary-light);
+    transform: scale(1.03);
+}
+
+.card-page-count {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(45, 55, 72, 0.85);
+    color: #ffffff;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+    backdrop-filter: blur(4px);
+    z-index: 2;
+}
+
+.page-thumbnail-card canvas {
+    max-width: 100%;
+    height: auto;
+    border-radius: 4px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.15);
+    background-color: #ffffff;
+}
+
+.thumbnail-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.action-btn-small {
+    background: var(--bg-main);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: var(--transition);
+    color: var(--text-main);
+}
+
+.action-btn-small:hover:not(:disabled) {
+    background: var(--primary-light);
+    color: var(--primary);
+    border-color: var(--primary);
+}
+
+.action-btn-small.delete:hover:not(:disabled) {
+    background: #fff5f5;
+    color: #e53e3e;
+    border-color: #e53e3e;
+}
+
