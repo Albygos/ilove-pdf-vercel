@@ -1,0 +1,17 @@
+.git
+.gitignore
+uploads/
+processed/
+*.log
+__pycache__/
+.pytest_cache/
+test_*.py
+fast_fix.py
+fix_upload.py
+fix_upload.js
+generate_other_langs.py
+generate_other_langs_deep.py
+generate_other_langs_fast.py
+generate_sitemap.py
+check_dict.py
+extract_keywords.py

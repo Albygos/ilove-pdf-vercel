@@ -1,0 +1,2369 @@
+import os
+import uuid
+import time
+import zipfile
+import shutil
+import io
+import threading
+import re
+from flask import Flask, request, jsonify, send_file, send_from_directory, redirect, abort
+from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF
+from PIL import Image
+from docx import Document
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+from pptx import Presentation
+from pptx.util import Inches, Pt
+import openpyxl
+from reportlab.platypus import Table as RLTable, TableStyle as RLTableStyle, PageBreak
+from reportlab.lib import colors
+from deep_translator import GoogleTranslator
+from functools import lru_cache
+
+from pdf_tools import *
+
+
+
+app = Flask(__name__)
+app.url_map.strict_slashes = False
+
+# Setup directories inside workspace
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SEO_KEYWORDS = set()
+try:
+    with open(os.path.join(BASE_DIR, 'seo_keywords.txt'), 'r', encoding='utf-16') as f:
+        for line in f:
+            line_slug = line.strip()
+            if line_slug:
+                SEO_KEYWORDS.add(line_slug)
+except Exception as e:
+    print(f"Warning: Could not load seo_keywords.txt: {e}")
+
+# Setup upload & processed directories (Vercel serverless requires /tmp)
+if os.environ.get('VERCEL'):
+    UPLOAD_FOLDER = '/tmp/uploads'
+    PROCESSED_FOLDER = '/tmp/processed'
+else:
+    try:
+        UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+        PROCESSED_FOLDER = os.path.join(BASE_DIR, 'processed')
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+    except (OSError, PermissionError):
+        UPLOAD_FOLDER = '/tmp/uploads'
+        PROCESSED_FOLDER = '/tmp/processed'
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['PROCESSED_FOLDER'] = PROCESSED_FOLDER
+# Limit maximum upload to 50MB
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
+def clean_old_files():
+    """Deletes files in uploads and processed folders older than 15 minutes."""
+    while True:
+        try:
+            now = time.time()
+            for folder in [UPLOAD_FOLDER, PROCESSED_FOLDER]:
+                if os.path.exists(folder):
+                    for filename in os.listdir(folder):
+                        file_path = os.path.join(folder, filename)
+                        try:
+                            # Skip special system files
+                            if filename.startswith('.'):
+                                continue
+                            if os.path.isfile(file_path) or os.path.islink(file_path):
+                                if os.path.getmtime(file_path) < now - 900:  # 15 minutes
+                                    os.unlink(file_path)
+                            elif os.path.isdir(file_path):
+                                if os.path.getmtime(file_path) < now - 900:
+                                    shutil.rmtree(file_path)
+                        except Exception as e:
+                            print(f"Error cleaning file {file_path}: {e}")
+        except Exception as e:
+            print(f"Cleanup loop error: {e}")
+        time.sleep(300)  # Check every 5 minutes
+
+# Start the clean up thread as a daemon
+cleanup_thread = threading.Thread(target=clean_old_files, daemon=True)
+cleanup_thread.start()
+
+from werkzeug.utils import secure_filename
+import traceback
+
+def get_unique_filename(ext):
+    return f"{uuid.uuid4().hex}.{ext}"
+
+from werkzeug.exceptions import HTTPException
+
+@app.errorhandler(Exception)
+def handle_global_exception(e):
+    if isinstance(e, HTTPException):
+        return e
+    traceback.print_exc()
+    if isinstance(e, ValueError):
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'error': 'An internal server error occurred.'}), 500
+
+def process_upload(request_files, expected_extensions, max_files=1):
+    """
+    Generic utility to validate and save uploaded files.
+    expected_extensions should be a list like ['.pdf'] or ['.jpg', '.png']
+    """
+    if not request_files:
+        raise ValueError('No files uploaded.')
+        
+    saved_paths = []
+    
+    # In some forms it's request.files.getlist('files'), in others (request.files.get('file') or request.files.get('files'))
+    # This standardizes to a list.
+    if isinstance(request_files, list):
+        files = request_files
+    else:
+        files = [request_files]
+        
+    if len(files) > max_files:
+        raise ValueError(f'Too many files uploaded. Maximum is {max_files}.')
+        
+    for f in files:
+        if f.filename == '':
+            continue
+            
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in expected_extensions:
+            raise ValueError(f'Invalid file type. Expected one of {", ".join(expected_extensions)}')
+            
+        secure_name = secure_filename(f.filename)
+        # We append a UUID to prevent collisions but keep the safe original name (if any)
+        final_name = f"{uuid.uuid4().hex}_{secure_name}" if secure_name else get_unique_filename(ext[1:])
+        
+        path = os.path.join(UPLOAD_FOLDER, final_name)
+        f.save(path)
+        saved_paths.append(path)
+        
+    if not saved_paths:
+        raise ValueError('No valid files were processed.')
+        
+    return saved_paths
+
+
+
+# Real Original ISO Language & Locale Validator (EXPANDED REGIONAL & COUNTRY CODES)
+VALID_LANG_CODES_SET = set(['af', 'af-za', 'am', 'am-et', 'ar', 'ar-ae', 'ar-bh', 'ar-dz', 'ar-eg', 'ar-iq', 'ar-jo', 'ar-kw', 'ar-lb', 'ar-ly', 'ar-ma', 'ar-om', 'ar-qa', 'ar-sa', 'ar-sd', 'ar-sy', 'ar-tn', 'ar-ye', 'az', 'bg', 'bg-bg', 'bn', 'bn-bd', 'bn-in', 'bs', 'ca', 'ca-es', 'ceb', 'ceb-ph', 'co', 'cs', 'cs-cz', 'cy', 'cy-gb', 'da', 'da-dk', 'de', 'de-at', 'de-ch', 'de-de', 'de-li', 'de-lu', 'el', 'el-cy', 'el-gr', 'en', 'en-au', 'en-ca', 'en-gb', 'en-ie', 'en-in', 'en-nz', 'en-ph', 'en-sg', 'en-us', 'en-za', 'eo', 'es', 'es-ar', 'es-bo', 'es-cl', 'es-co', 'es-cr', 'es-cub', 'es-do', 'es-ec', 'es-es', 'es-gt', 'es-hn', 'es-mx', 'es-ni', 'es-pa', 'es-pe', 'es-pr', 'es-py', 'es-sv', 'es-uy', 'es-ve', 'et', 'et-ee', 'eu', 'eu-es', 'fa', 'fa-ir', 'fi', 'fi-fi', 'fil', 'fil-ph', 'fr', 'fr-be', 'fr-ca', 'fr-ch', 'fr-ci', 'fr-cm', 'fr-dz', 'fr-fr', 'fr-lu', 'fr-mc', 'fr-sn', 'fy', 'ga', 'ga-ie', 'gd', 'gl', 'gl-es', 'gu', 'gu-in', 'ha', 'ha-ng', 'haw', 'haw-us', 'he', 'hi', 'hi-in', 'hr', 'hr-hr', 'ht', 'ht-ht', 'hu', 'hu-hu', 'hy', 'id', 'id-id', 'ig', 'ig-ng', 'is', 'is-is', 'it', 'it-ch', 'it-it', 'ja', 'ja-jp', 'jv', 'jv-id', 'ka', 'kk', 'km', 'km-kh', 'kn', 'kn-in', 'ko', 'ko-kr', 'la', 'lb', 'lo', 'lo-la', 'lt', 'lt-lt', 'lv', 'lv-lv', 'mg', 'mg-mg', 'mi', 'mi-nz', 'mk', 'mk-mk', 'ml', 'ml-in', 'mn', 'mr', 'mr-in', 'ms', 'ms-my', 'ms-sg', 'mt', 'mt-mt', 'my', 'my-mm', 'nb-no', 'ne', 'ne-np', 'nl', 'nl-be', 'nl-nl', 'nn-no', 'no-no', 'ny', 'ny-mw', 'pa', 'pa-in', 'pa-pk', 'pl', 'pl-pl', 'ps', 'ps-af', 'pt', 'pt-ao', 'pt-br', 'pt-mz', 'pt-pt', 'ro', 'ro-md', 'ro-ro', 'ru', 'ru-by', 'ru-kz', 'ru-ru', 'sd', 'sd-pk', 'si', 'si-lk', 'sk', 'sk-sk', 'sl', 'sl-si', 'sm', 'sm-ws', 'so', 'so-so', 'sq', 'sq-al', 'sr', 'sr-rs', 'st', 'st-ls', 'su', 'su-id', 'sv', 'sv-fi', 'sv-se', 'sw', 'sw-ke', 'sw-tz', 'ta', 'ta-in', 'ta-lk', 'ta-sg', 'te', 'te-in', 'th', 'th-th', 'tn', 'tn-bw', 'tr', 'tr-tr', 'uk', 'uk-ua', 'ur', 'ur-in', 'ur-pk', 'uz', 've', 'vi', 'vi-vn', 'xh', 'xh-za', 'yo', 'yo-ng', 'zh', 'zh-cn', 'zh-hk', 'zh-mo', 'zh-sg', 'zh-tw', 'zu', 'zu-za'])
+
+def is_valid_language_code(code):
+    if not code:
+        return False
+    code_lower = code.lower()
+    return code_lower in VALID_LANG_CODES_SET
+
+SUPPORTED_LANGS = {'en': 'English', 'es': 'Español', 'fr': 'Français', 'de': 'Deutsch', 'pt': 'Português', 'hi': 'हिन्दी', 'ar': 'العربية', 'zh': '中文', 'ja': '日本語', 'ko': '한국어', 'ru': 'Русский', 'it': 'Italiano', 'nl': 'Nederlands', 'tr': 'Türkçe', 'pl': 'Polski', 'sv': 'Svenska', 'id': 'Bahasa Indonesia', 'vi': 'Tiếng Việt', 'th': 'ไทย', 'uk': 'Українська', 'el': 'Ελληνικά', 'he': 'עברית', 'bn': 'বাংলা', 'ta': 'தமிழ்', 'te': 'తెలుగు', 'mr': 'मराठी', 'gu': 'ગુજરાતી', 'kn': 'કન્નડ', 'ur': 'اردو', 'sw': 'Kiswahili', 'ms': 'Bahasa Melayu', 'fil': 'Filipino', 'cs': 'Čeština', 'hu': 'Magyar', 'da': 'Dansk', 'fi': 'Suomi', 'sk': 'Slovenčina', 'ro': 'Română', 'bg': 'Български', 'hr': 'Hrvatski', 'sr': 'Српски', 'sl': 'Slovenščina', 'et': 'Eesti', 'lv': 'Latviešu', 'lt': 'Lietuvių', 'sq': 'Shqip', 'mk': 'Македонски', 'ka': 'ქართული', 'hy': 'Հայերեն', 'az': 'Azərbaycan', 'kk': 'Қазақша', 'uz': 'O‘zbekcha', 'mn': 'Монгол', 'my': 'မြန်မာ', 'km': 'ភាសាខ្មែរ', 'lo': 'ພາສາລາວ', 'si': 'සිංහල', 'ne': 'नेपाली', 'pa': 'ਪੰਜਾਬੀ', 'am': 'አማርኛ', 'so': 'Soomaali', 'yo': 'Yorùbá', 'ig': 'Asụsụ Igbo', 'ha': 'Hausa', 'zu': 'isiZulu', 'xh': 'isiXhosa', 'af': 'Afrikaans', 'gl': 'Galego', 'ca': 'Català', 'eu': 'Euskara', 'cy': 'Cymraeg', 'ga': 'Gaeilge', 'is': 'Íslenska', 'mt': 'Malti', 'lb': 'Lëtzebuergesch', 'bs': 'Bosanski', 'fa': 'فارسی', 'ps': 'پښتو', 'sd': 'سنڌي', 'su': 'Basa Sunda', 'jv': 'Basa Jawa', 'ceb': 'Cebuano', 'haw': 'ʻŌlelo Hawaiʻi', 'eo': 'Esperanto', 'la': 'Latina', 'gd': 'Gàidhlig', 'fy': 'Frysk', 'co': 'Corsu', 'mi': 'Te Reo Māori', 'sm': 'Gagana Sāmoa', 'ny': 'Chichewa', 'ht': 'Kreyòl Ayisyen', 'mg': 'Malagasy', 'st': 'Sesotho', 'tn': 'Setswana', 've': 'Tshivenḓa'}
+
+SLUG_TO_FILE = {
+    '': 'index.html',
+    'merge_pdf': 'merge.html',
+    'split_pdf': 'split.html',
+    'compress_pdf': 'compress.html',
+    'word_to_pdf': 'word-to-pdf.html',
+    'pdf_to_word': 'pdf-to-word.html',
+    'jpg_to_pdf': 'jpg-to-pdf.html',
+    'pdf_to_jpg': 'pdf-to-jpg.html',
+    'rotate_pdf': 'rotate.html',
+    'protect-pdf': 'protect.html',
+    'unlock_pdf': 'unlock.html',
+    'pdf_add_watermark': 'watermark.html',
+    'add_pdf_page_number': 'page-numbers.html',
+    'organize-pdf': 'organize.html',
+    'html-to-pdf': 'html-to-pdf.html',
+    'extract-text': 'extract-text.html',
+    'remove-pages': 'delete-pages.html',
+    'compare-pdf': 'compare.html',
+    'powerpoint_to_pdf': 'powerpoint-to-pdf.html',
+    'powerpoint-to-pdf': 'powerpoint-to-pdf.html',
+    'pdf_to_powerpoint': 'pdf-to-powerpoint.html',
+    'pdf-to-powerpoint': 'pdf-to-powerpoint.html',
+    'excel_to_pdf': 'excel-to-pdf.html',
+    'excel-to-pdf': 'excel-to-pdf.html',
+    'pdf_to_excel': 'pdf-to-excel.html',
+    'pdf-to-excel': 'pdf-to-excel.html',
+    'convert-pdf-to-pdfa': 'pdf-to-pdfa.html',
+    'repair-pdf': 'repair-pdf.html',
+    'ocr-pdf': 'ocr-pdf.html',
+    'pdf-summarize': 'pdf-summarize.html',
+    'translate-pdf': 'translate-pdf.html',
+    'sign-pdf': 'sign-pdf.html',
+    'privacy-policy': 'privacy-policy.html',
+    'terms': 'terms.html',
+    'about': 'about.html',
+    'contact': 'contact.html',
+    'cookie-policy': 'cookie-policy.html',
+    'disclaimer': 'disclaimer.html'
+}
+
+LEGACY_REDIRECTS = {
+    'merge': 'merge_pdf',
+    'split': 'split_pdf',
+    'compress': 'compress_pdf',
+    'word-to-pdf': 'word_to_pdf',
+    'pdf-to-word': 'pdf_to_word',
+    'jpg-to-pdf': 'jpg_to_pdf',
+    'pdf-to-jpg': 'pdf_to_jpg',
+    'rotate': 'rotate_pdf',
+    'protect': 'protect-pdf',
+    'unlock': 'unlock_pdf',
+    'watermark': 'pdf_add_watermark',
+    'page-numbers': 'add_pdf_page_number',
+    'organize': 'organize-pdf',
+    'delete-pages': 'remove-pages',
+    'compare': 'compare-pdf',
+    'html_to_pdf': 'html-to-pdf',
+    'extract_text': 'extract-text',
+    'remove_pages': 'remove-pages',
+    'compare_pdf': 'compare-pdf',
+    'powerpoint_to_pdf': 'powerpoint-to-pdf',
+    'pdf_to_powerpoint': 'pdf-to-powerpoint',
+    'excel_to_pdf': 'excel-to-pdf',
+    'pdf_to_excel': 'pdf-to-excel',
+    'repair_pdf': 'repair-pdf',
+    'ocr_pdf': 'ocr-pdf',
+    'translate_pdf': 'translate-pdf',
+    'sign_pdf': 'sign-pdf'
+}
+
+TRANSLATIONS = {'es': {'Every tool you need to work with PDFs in one place': 'Todas las herramientas PDF que necesitas en un solo lugar', 'Every tool you need to use PDFs, at your fingertips. All are 100% FREE and easy to use! Merge, split, compress, convert, rotate, unlock and watermark PDFs with just a few clicks.': 'Todas las herramientas PDF que necesitas al alcance de tu mano. ¡100% GRATIS y fáciles de usar! Une, divide, comprime, convierte, rota, desbloquea y añade marcas de agua a tus archivos PDF con solo unos pocos clics.', 'Merge PDF': 'Unir PDF', 'Split PDF': 'Dividir PDF', 'Compress PDF': 'Comprimir PDF', 'Word to PDF': 'Word a PDF', 'PDF to Word': 'PDF a Word', 'JPG to PDF': 'JPG a PDF', 'PDF to JPG': 'PDF a JPG', 'Rotate PDF': 'Rotar PDF', 'Protect PDF': 'Proteger PDF', 'Unlock PDF': 'Desbloquear PDF', 'Watermark': 'Marca de agua', 'Page Numbers': 'Números de página', 'Organize PDF': 'Organizar PDF', 'HTML to PDF': 'HTML a PDF', 'Extract Text': 'Extraer texto', 'Delete Pages': 'Eliminar páginas', 'PDF to PDF/A': 'PDF a PDF/A', 'Repair PDF': 'Reparar PDF', 'OCR PDF': 'OCR PDF', 'AI Summarizer': 'Resumidor de IA', 'Translate PDF': 'Traducir PDF', 'Sign PDF': 'Firmar PDF', 'Compare PDF': 'Comparar PDF', 'All PDF Tools': 'Todas las herramientas PDF', 'Convert PDF': 'Convertir PDF', 'Log in': 'Iniciar sesión', 'Sign up': 'Registrarse', 'Home': 'Inicio'}, 'fr': {'Every tool you need to work with PDFs in one place': 'Tous les outils PDF dont vous avez besoin au même endroit', 'Every tool you need to use PDFs, at your fingertips. All are 100% FREE and easy to use! Merge, split, compress, convert, rotate, unlock and watermark PDFs with just a few clicks.': 'Tous les outils PDF à portée de main. 100% GRATUITS et faciles à utiliser ! Fusionnez, divisez, compressez, convertissez, pivotez, déverrouillez et ajoutez un filigrane à vos PDFs en quelques clics.', 'Merge PDF': 'Fusionner PDF', 'Split PDF': 'Diviser PDF', 'Compress PDF': 'Compresser PDF', 'Word to PDF': 'Word en PDF', 'PDF to Word': 'PDF en Word', 'JPG to PDF': 'JPG en PDF', 'PDF to JPG': 'PDF en JPG', 'Rotate PDF': 'Pivoter PDF', 'Protect PDF': 'Protéger PDF', 'Unlock PDF': 'Déverrouiller PDF', 'Watermark': 'Filigrane', 'Page Numbers': 'Numérotation', 'Organize PDF': 'Organiser PDF', 'HTML to PDF': 'HTML en PDF', 'Extract Text': 'Extraire le texte', 'Delete Pages': 'Supprimer des pages', 'PDF to PDF/A': 'PDF en PDF/A', 'Repair PDF': 'Réparer PDF', 'OCR PDF': 'OCR PDF', 'AI Summarizer': 'Résumeur IA', 'Translate PDF': 'Traduire PDF', 'Sign PDF': 'Signer PDF', 'Compare PDF': 'Comparer PDF', 'All PDF Tools': 'Tous les outils PDF', 'Convert PDF': 'Convertir PDF', 'Log in': 'Connexion', 'Sign up': "S'inscrire", 'Home': 'Accueil'}, 'de': {'Every tool you need to work with PDFs in one place': 'Jedes PDF-Werkzeug, das Sie benötigen, an einem Ort', 'Every tool you need to use PDFs, at your fingertips. All are 100% FREE and easy to use! Merge, split, compress, convert, rotate, unlock and watermark PDFs with just a few clicks.': 'Alle PDF-Werkzeuge für Sie bereit. 100% KOSTENLOS und einfach zu bedienen! PDF-Dateien zusammenfügen, teilen, komprimieren, konvertieren, drehen, entsperren und Wasserzeichen hinzufügen.', 'Merge PDF': 'PDF zusammenfügen', 'Split PDF': 'PDF teilen', 'Compress PDF': 'PDF komprimieren', 'Word to PDF': 'Word in PDF', 'PDF to Word': 'PDF in Word', 'JPG to PDF': 'JPG in PDF', 'PDF to JPG': 'PDF in JPG', 'Rotate PDF': 'PDF drehen', 'Protect PDF': 'PDF schützen', 'Unlock PDF': 'PDF entsperren', 'Watermark': 'Wasserzeichen', 'Page Numbers': 'Seitenzahlen', 'Organize PDF': 'PDF organisieren', 'HTML to PDF': 'HTML in PDF', 'Extract Text': 'Text extrahieren', 'Delete Pages': 'Seiten löschen', 'PDF to PDF/A': 'PDF in PDF/A', 'Repair PDF': 'PDF reparieren', 'OCR PDF': 'OCR PDF', 'AI Summarizer': 'KI-Zusammenfassung', 'Translate PDF': 'PDF übersetzen', 'Sign PDF': 'PDF unterschreiben', 'Compare PDF': 'PDF vergleichen', 'All PDF Tools': 'Alle PDF-Werkzeuge', 'Convert PDF': 'PDF konvertieren', 'Log in': 'Einloggen', 'Sign up': 'Registrieren', 'Home': 'Startseite'}, 'pt': {'Every tool you need to work with PDFs in one place': 'Todas as ferramentas PDF necessárias em um só lugar', 'Every tool you need to use PDFs, at your fingertips. All are 100% FREE and easy to use! Merge, split, compress, convert, rotate, unlock and watermark PDFs with just a few clicks.': "Todas as ferramentas PDF ao seu alcance. 100% GRATUITAS e fáceis de usar! Mesclar, dividir, comprimir, converter, rotacionar, desbloquear e adicionar marcas d'água aos seus PDFs.", 'Merge PDF': 'Mesclar PDF', 'Split PDF': 'Dividir PDF', 'Compress PDF': 'Comprimir PDF', 'Word to PDF': 'Word para PDF', 'PDF to Word': 'PDF para Word', 'JPG to PDF': 'JPG para PDF', 'PDF to JPG': 'PDF para JPG', 'Rotate PDF': 'Rotacionar PDF', 'Protect PDF': 'Proteger PDF', 'Unlock PDF': 'Desbloquear PDF', 'Watermark': "Marca d'água", 'Page Numbers': 'Números de página', 'Organize PDF': 'Organizar PDF', 'HTML to PDF': 'HTML para PDF', 'Extract Text': 'Extrair texto', 'Delete Pages': 'Excluir páginas', 'PDF to PDF/A': 'PDF para PDF/A', 'Repair PDF': 'Reparar PDF', 'OCR PDF': 'OCR PDF', 'AI Summarizer': 'Resumidor de IA', 'Translate PDF': 'Traduzir PDF', 'Sign PDF': 'Assinar PDF', 'Compare PDF': 'Comparar PDF', 'All PDF Tools': 'Todas as ferramentas PDF', 'Convert PDF': 'Converter PDF', 'Log in': 'Entrar', 'Sign up': 'Cadastrar', 'Home': 'Início'}, 'hi': {'Every tool you need to work with PDFs in one place': 'पीडीएफ पर काम करने के लिए सभी आवश्यक उपकरण एक जगह', 'Every tool you need to use PDFs, at your fingertips. All are 100% FREE and easy to use! Merge, split, compress, convert, rotate, unlock and watermark PDFs with just a few clicks.': 'आपकी उंगलियों पर सभी पीडीएफ उपकरण। 100% मुफ़्त और उपयोग में आसान! कुछ ही क्लिक में पीडीएफ़ को मर्ज, स्प्लिट, कंप्रेस, कन्वर्ट, रोटेट, अनलॉक और वॉटरमार्क करें।', 'Merge PDF': 'पीडीएफ मर्ज करें', 'Split PDF': 'पीडीएफ विभाजित करें', 'Compress PDF': 'पीडीएफ कंप्रेस करें', 'Word to PDF': 'वर्ड से पीडीएफ', 'PDF to Word': 'पीडीएफ से वर्ड', 'JPG to PDF': 'जेपीजी से पीडीएफ', 'PDF to JPG': 'पीडीएफ से जेपीजी', 'Rotate PDF': 'पीडीएफ घुमाएँ', 'Protect PDF': 'पीडीएफ सुरक्षित करें', 'Unlock PDF': 'पीडीएफ अनलॉक करें', 'Watermark': 'वॉटरमार्क', 'Page Numbers': 'पेज नंबर', 'Organize PDF': 'पीडीएफ व्यवस्थित करें', 'HTML to PDF': 'एचटीएमएल से पीडीएफ', 'Extract Text': 'टेक्स्ट निकालें', 'Delete Pages': 'पेज हटाएं', 'PDF to PDF/A': 'पीडीएफ से पीडीएफ/ए', 'Repair PDF': 'पीडीएफ रिपेयर करें', 'OCR PDF': 'ओसीआर पीडीएफ', 'AI Summarizer': 'एआई सारांश', 'Translate PDF': 'अनुवाद करें', 'Sign PDF': 'हस्ताक्षर करें', 'Compare PDF': 'पीडीएफ तुलना करें', 'All PDF Tools': 'सभी पीडीएफ टूल्स', 'Convert PDF': 'कन्वर्ट पीडीएफ', 'Log in': 'लॉगिन', 'Sign up': 'साइन अप', 'Home': 'होम'}, 'ar': {'Every tool you need to work with PDFs in one place': 'جميع أدوات PDF التي تحتاجها في مكان واحد', 'Merge PDF': 'دمج PDF', 'Split PDF': 'تقسيم PDF', 'Compress PDF': 'ضغط PDF', 'Word to PDF': 'Word إلى PDF', 'PDF to Word': 'PDF إلى Word', 'JPG to PDF': 'JPG إلى PDF', 'PDF to JPG': 'PDF إلى JPG', 'Rotate PDF': 'تدوير PDF', 'Protect PDF': 'حماية PDF', 'Unlock PDF': 'فتح PDF', 'Watermark': 'علامة مائية', 'Page Numbers': 'أرقام الصفحات', 'Organize PDF': 'تنظيم PDF', 'HTML to PDF': 'HTML إلى PDF', 'Extract Text': 'استخراج النص', 'Delete Pages': 'حذف الصفحات', 'PDF to PDF/A': 'PDF إلى PDF/A', 'Repair PDF': 'إصلاح PDF', 'OCR PDF': 'التعرف الضوئي', 'AI Summarizer': 'ملخص الذكاء الاصطناعي', 'Translate PDF': 'ترجمة PDF', 'Sign PDF': 'توقيع PDF', 'Compare PDF': 'مقارنة PDF', 'All PDF Tools': 'جميع أدوات PDF', 'Convert PDF': 'تحويل PDF', 'Log in': 'تسجيل الدخول', 'Sign up': 'إنشاء حساب', 'Home': 'الرئيسية'}, 'zh': {'Every tool you need to work with PDFs in one place': '您在一个地方所需的所有 PDF 工具', 'Merge PDF': '合并 PDF', 'Split PDF': '拆分 PDF', 'Compress PDF': '压缩 PDF', 'Word to PDF': 'Word 转 PDF', 'PDF to Word': 'PDF 转 Word', 'JPG to PDF': 'JPG 转 PDF', 'PDF to JPG': 'PDF 转 JPG', 'Rotate PDF': '旋转 PDF', 'Protect PDF': '加密 PDF', 'Unlock PDF': '解密 PDF', 'Watermark': '添加水印', 'Page Numbers': '添加页码', 'Organize PDF': '组织 PDF', 'HTML to PDF': 'HTML 转 PDF', 'Extract Text': '提取文本', 'Delete Pages': '删除页面', 'PDF to PDF/A': 'PDF 转 PDF/A', 'Repair PDF': '修复 PDF', 'OCR PDF': 'OCR 识别', 'AI Summarizer': 'AI 摘要', 'Translate PDF': '翻译 PDF', 'Sign PDF': '电子签名', 'Compare PDF': '对比 PDF', 'All PDF Tools': '所有 PDF 工具', 'Convert PDF': '转换 PDF', 'Log in': '登录', 'Sign up': '注册', 'Home': '首页'}, 'ja': {'Every tool you need to work with PDFs in one place': 'PDFの作業に必要なすべてのツールを1箇所に', 'Merge PDF': 'PDF 結合', 'Split PDF': 'PDF 分割', 'Compress PDF': 'PDF 圧縮', 'Word to PDF': 'Word から PDF', 'PDF to Word': 'PDF から Word', 'JPG to PDF': 'JPG から PDF', 'PDF to JPG': 'PDF から JPG', 'Rotate PDF': 'PDF 回転', 'Protect PDF': 'PDF 保護', 'Unlock PDF': 'PDF ロック解除', 'Watermark': '透かし追加', 'Page Numbers': 'ページ番号', 'Organize PDF': 'PDF 整理', 'HTML to PDF': 'HTML から PDF', 'Extract Text': 'テキスト抽出', 'Delete Pages': 'ページ削除', 'PDF to PDF/A': 'PDF から PDF/A', 'Repair PDF': 'PDF 修復', 'OCR PDF': 'OCR 処理', 'AI Summarizer': 'AI 要約', 'Translate PDF': 'PDF 翻訳', 'Sign PDF': 'PDF 署名', 'Compare PDF': 'PDF 比較', 'All PDF Tools': 'すべての PDF ツール', 'Convert PDF': 'PDF 変換', 'Log in': 'ログイン', 'Sign up': '新規登録', 'Home': 'ホーム'}, 'ru': {'Every tool you need to work with PDFs in one place': 'Все инструменты PDF, необходимые для работы, в одном месте', 'Merge PDF': 'Объединить PDF', 'Split PDF': 'Разделить PDF', 'Compress PDF': 'Сжать PDF', 'Word to PDF': 'Word в PDF', 'PDF to Word': 'PDF в Word', 'JPG to PDF': 'JPG в PDF', 'PDF to JPG': 'PDF в JPG', 'Rotate PDF': 'Повернуть PDF', 'Protect PDF': 'Защитить PDF', 'Unlock PDF': 'Снять защиту PDF', 'Watermark': 'Водяной знак', 'Page Numbers': 'Номера страниц', 'Organize PDF': 'Упорядочить PDF', 'HTML to PDF': 'HTML в PDF', 'Extract Text': 'Извлечь текст', 'Delete Pages': 'Удалить страницы', 'PDF to PDF/A': 'PDF в PDF/A', 'Repair PDF': 'Восстановить PDF', 'OCR PDF': 'Распознавание OCR', 'AI Summarizer': 'ИИ Суммаризатор', 'Translate PDF': 'Перевести PDF', 'Sign PDF': 'Подписать PDF', 'Compare PDF': 'Сравнить PDF', 'All PDF Tools': 'Все инструменты PDF', 'Convert PDF': 'Конвертировать PDF', 'Log in': 'Войти', 'Sign up': 'Регистрация', 'Home': 'Главная'}}
+# Serve explicit static assets from root
+@app.route('/style.css')
+def serve_css():
+    return send_from_directory(BASE_DIR, 'style.css')
+
+@app.route('/ad-manager.js')
+def serve_ad_manager():
+    return send_from_directory(BASE_DIR, 'ad-manager.js')
+
+@app.route('/site.webmanifest')
+def serve_webmanifest():
+    return send_from_directory(BASE_DIR, 'site.webmanifest')
+
+@app.route('/favicon.ico')
+def serve_favicon_ico():
+    return send_from_directory(BASE_DIR, 'favicon.ico')
+
+@app.route('/favicon-32x32.png')
+def serve_favicon_32():
+    return send_from_directory(BASE_DIR, 'favicon-32x32.png')
+
+@app.route('/favicon-16x16.png')
+def serve_favicon_16():
+    return send_from_directory(BASE_DIR, 'favicon-16x16.png')
+
+@app.route('/favicon-192x192.png')
+def serve_favicon_192():
+    return send_from_directory(BASE_DIR, 'favicon-192x192.png')
+
+@app.route('/apple-touch-icon.png')
+def serve_apple_icon():
+    return send_from_directory(BASE_DIR, 'apple-touch-icon.png')
+
+@app.route('/logo-branding.png')
+def serve_logo_branding():
+    return send_from_directory(BASE_DIR, 'logo-branding.png')
+
+@app.route('/ads.txt')
+def serve_ads_txt():
+    return send_from_directory(BASE_DIR, 'ads.txt')
+
+@app.route('/privacy-policy')
+def serve_privacy_policy():
+    return send_from_directory(BASE_DIR, 'privacy-policy.html')
+
+@app.route('/terms')
+def serve_terms():
+    return send_from_directory(BASE_DIR, 'terms.html')
+
+@app.route('/about')
+def serve_about():
+    return send_from_directory(BASE_DIR, 'about.html')
+
+@app.route('/contact')
+def serve_contact():
+    return send_from_directory(BASE_DIR, 'contact.html')
+
+@app.route('/cookie-policy')
+def serve_cookie_policy():
+    return send_from_directory(BASE_DIR, 'cookie-policy.html')
+
+@app.route('/disclaimer')
+def serve_disclaimer():
+    return send_from_directory(BASE_DIR, 'disclaimer.html')
+
+# Serve pages cleanly matching URLs and localized parameters
+@app.route('/')
+@app.route('/<lang>')
+def index_route(lang=None):
+    if lang and is_valid_language_code(lang):
+        return serve_tool_page('', lang)
+    if lang and (lang in SLUG_TO_FILE or lang in LEGACY_REDIRECTS):
+        return serve_tool_page(lang, None)
+    if lang:
+        return dynamic_seo_page(lang)
+    return serve_tool_page('', None)
+
+@app.route('/<lang>/<slug>')
+def lang_tool_route(lang, slug):
+    if is_valid_language_code(lang) and (slug in SLUG_TO_FILE or slug in LEGACY_REDIRECTS):
+        return serve_tool_page(slug, lang)
+    elif lang in SLUG_TO_FILE or lang in LEGACY_REDIRECTS:
+        return serve_tool_page(lang, None)
+    return dynamic_seo_page(f"{lang}/{slug}")
+
+def serve_tool_page(slug, lang=None):
+    # Backward compatibility redirects
+    if slug in LEGACY_REDIRECTS:
+        try:
+            target = LEGACY_REDIRECTS[slug]
+            url = f"/{lang}/{target}" if lang else f"/{target}"
+            return redirect(url, code=301)
+        except Exception as e:
+            import traceback
+            return traceback.format_exc(), 500
+
+    filename = SLUG_TO_FILE.get(slug)
+    if not filename:
+        # Fallback check if first parameter was actually slug without lang
+        if slug in SUPPORTED_LANGS:
+            filename = 'index.html'
+        else:
+            return "Page not found.", 404
+            
+    filepath = os.path.join(BASE_DIR, filename)
+    if not os.path.exists(filepath):
+        return "File not found.", 404
+        
+    with open(filepath, 'r', encoding='utf-8') as f:
+        html = f.read()
+        
+    # --- Inject Canonical & Hreflang SEO Metadata ---
+    root_domain = "https://ilovespdfs.in"
+    lang_sub = f"{lang}/" if lang and lang != 'en' else ""
+    canonical_url = f"{root_domain}/{lang_sub}{slug}"
+    
+    hreflangs = []
+    hreflangs.append(f'<link rel="alternate" hreflang="x-default" href="{root_domain}/{slug}" />')
+    hreflangs.append(f'<link rel="alternate" hreflang="en" href="{root_domain}/{slug}" />')
+    indian_langs_set = {'hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ur', 'pa', 'ml', 'or'}
+    for l in SUPPORTED_LANGS:
+        if l != 'en':
+            hreflangs.append(f'<link rel="alternate" hreflang="{l}" href="{root_domain}/{l}/{slug}" />')
+            if l in indian_langs_set:
+                hreflangs.append(f'<link rel="alternate" hreflang="{l}-in" href="{root_domain}/{l}/{slug}" />')
+            
+    hreflang_tags = "\n    ".join(hreflangs)
+    
+    # Strip existing canonical and inject new
+    import re
+    html = re.sub(r'<link\s+rel=["\']canonical["\'].*?>', '', html, flags=re.IGNORECASE)
+    injection = f'<link rel="canonical" href="{canonical_url}" />\n    {hreflang_tags}'
+    html = re.sub(r'(<head\b[^>]*>)', r'\1\n    ' + injection, html, flags=re.IGNORECASE)
+    
+    # --- Server-Side Dictionary Translation ---
+    if lang and lang in TRANSLATIONS and lang != 'en':
+        trans_dict = TRANSLATIONS[lang]
+        sorted_keys = sorted(trans_dict.keys(), key=len, reverse=True)
+        for key in sorted_keys:
+            html = html.replace(key, trans_dict[key])
+            
+    html = apply_language_translations(html, lang)
+    html = inject_seo_internal_links(html, slug, lang)
+    return html
+
+# Compatibility fallbacks
+@app.route('/merge')
+@app.route('/split')
+@app.route('/compress')
+@app.route('/word-to-pdf')
+@app.route('/pdf-to-word')
+@app.route('/jpg-to-pdf')
+@app.route('/pdf-to-jpg')
+@app.route('/rotate')
+@app.route('/protect')
+@app.route('/unlock')
+@app.route('/watermark')
+@app.route('/page-numbers')
+@app.route('/organize')
+@app.route('/html-to-pdf')
+@app.route('/extract-text')
+@app.route('/delete-pages')
+@app.route('/compare')
+def legacy_page_redirect():
+    slug = request.path.strip('/')
+    return serve_tool_page(slug, None)
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({'error': 'File is too large. Maximum size is 50MB.'}), 413
+
+# --- PDF Tools API ---
+
+@app.route('/api/merge', methods=['POST'])
+def merge_pdfs():
+    try:
+        saved_paths = process_upload(request.files.getlist('files'), ['.pdf'], max_files=100)
+        if len(saved_paths) < 2:
+            raise ValueError('At least 2 PDF files are required for merging.')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+
+        # Merge
+        merger = PdfWriter()
+        for path in saved_paths:
+            merger.append(path)
+
+        out_filename = f"merged_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'wb') as f_out:
+            merger.write(f_out)
+        merger.close()
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        # Clean up input uploads immediately
+        for path in saved_paths:
+            try:
+                os.remove(path)
+            except:
+                pass
+
+@app.route('/api/split', methods=['POST'])
+def split_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+
+    ranges_str = request.form.get('ranges', '1-end') # e.g. "1-3, 4-5" or "1-end"
+    
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+
+    try:
+        reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+
+        # Parse ranges
+        ranges = []
+        parts = [p.strip() for p in ranges_str.split(',') if p.strip()]
+        
+        try:
+            for part in parts:
+                if '-' in part:
+                    start_s, end_s = part.split('-', 1)
+                    start_s = start_s.strip()
+                    end_s = end_s.strip()
+                    
+                    start = int(start_s) if start_s else 1
+                    if end_s.lower() == 'end' or not end_s:
+                        end = total_pages
+                    else:
+                        end = int(end_s)
+                else:
+                    start = int(part)
+                    end = start
+                
+                # Bound checking (1-based index)
+                start = max(1, min(start, total_pages))
+                end = max(1, min(end, total_pages))
+                if start <= end:
+                    ranges.append((start, end))
+                else:
+                    ranges.append((end, start))
+        except ValueError:
+            return jsonify({'error': 'Invalid range format. Please use integers like "1-3" or "1-end".'}), 400
+
+        if not ranges:
+            return jsonify({'error': 'Invalid ranges specified.'}), 400
+
+        # If only one range, return single PDF
+        if len(ranges) == 1:
+            start, end = ranges[0]
+            writer = PdfWriter()
+            for p_num in range(start - 1, end):
+                writer.add_page(reader.pages[p_num])
+            
+            out_filename = f"split_{start}-{end}_{uuid.uuid4().hex[:8]}.pdf"
+            out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+            with open(out_path, 'wb') as f_out:
+                writer.write(f_out)
+            
+            return jsonify({'download_url': f'/download/{out_filename}'})
+        else:
+            # If multiple ranges, create a ZIP
+            zip_filename = f"split_{uuid.uuid4().hex[:8]}.zip"
+            zip_path = os.path.join(PROCESSED_FOLDER, zip_filename)
+            
+            with zipfile.ZipFile(zip_path, 'w') as zf:
+                for idx, (start, end) in enumerate(ranges):
+                    writer = PdfWriter()
+                    for p_num in range(start - 1, end):
+                        writer.add_page(reader.pages[p_num])
+                    
+                    pdf_bytes = io.BytesIO()
+                    writer.write(pdf_bytes)
+                    pdf_bytes.seek(0)
+                    zf.writestr(f"split_range_{idx+1}_{start}-{end}.pdf", pdf_bytes.read())
+
+            return jsonify({'download_url': f'/download/{zip_filename}'})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/compress', methods=['POST'])
+def compress_pdf():
+    try:
+        saved_paths = process_upload((request.files.get('file') or request.files.get('files')), ['.pdf'])
+        input_path = saved_paths[0]
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+        # Try PyMuPDF optimization first (highly effective)
+        try:
+            doc = fitz.open(input_path)
+            out_filename = f"compressed_{uuid.uuid4().hex[:8]}.pdf"
+            out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+            doc.save(out_path, garbage=4, deflate=True, clean=True)
+            doc.close()
+        except Exception:
+            # Fallback to pypdf stream compression
+            reader = PdfReader(input_path)
+            writer = PdfWriter()
+            for page in reader.pages:
+                added_page = writer.add_page(page)
+                added_page.compress_content_streams()
+            out_filename = f"compressed_{uuid.uuid4().hex[:8]}.pdf"
+            out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+            with open(out_path, 'wb') as f_out:
+                writer.write(f_out)
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/jpg_to_pdf', methods=['POST'])
+def jpg_to_pdf():
+    try:
+        saved_paths = process_upload(request.files.getlist('files'), ['.jpg', '.jpeg', '.png', '.webp', '.bmp'], max_files=100)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+
+        # Convert images to PDF
+        images = []
+        for path in saved_paths:
+            img = Image.open(path)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            images.append(img)
+
+        out_filename = f"converted_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        
+        if images:
+            images[0].save(out_path, save_all=True, append_images=images[1:])
+
+        # Close all image handlers
+        for img in images:
+            img.close()
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        for path in saved_paths:
+            try:
+                os.remove(path)
+            except:
+                pass
+
+@app.route('/api/pdf_to_jpg', methods=['POST'])
+def pdf_to_jpg():
+    try:
+        saved_paths = process_upload((request.files.get('file') or request.files.get('files')), ['.pdf'])
+        input_path = saved_paths[0]
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+        doc = fitz.open(input_path)
+        zip_filename = f"images_{uuid.uuid4().hex[:8]}.zip"
+        zip_path = os.path.join(PROCESSED_FOLDER, zip_filename)
+
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            for idx, page in enumerate(doc):
+                # Render page to image (pixmap)
+                pix = page.get_pixmap(dpi=150)
+                # Convert colorspace to RGB if it is not RGB
+                if pix.colorspace and pix.colorspace.n != 3:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                img_data = pix.tobytes("jpg")
+                zf.writestr(f"page_{idx+1}.jpg", img_data)
+
+        doc.close()
+        return jsonify({'download_url': f'/download/{zip_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/rotate', methods=['POST'])
+def rotate_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+
+    try:
+        angle = int(request.form.get('angle', 90))
+        if angle not in [90, 180, 270, 360, -90, -180, -270]:
+            angle = 90
+    except ValueError:
+        angle = 90
+
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+
+    try:
+        reader = PdfReader(input_path)
+        writer = PdfWriter()
+
+        for page in reader.pages:
+            page.rotate(angle)
+            writer.add_page(page)
+
+        out_filename = f"rotated_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'wb') as f_out:
+            writer.write(f_out)
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/protect', methods=['POST'])
+def protect_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    password = request.form.get('password')
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    if not password:
+        return jsonify({'error': 'Password is required to protect the PDF.'}), 400
+
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+
+    try:
+        reader = PdfReader(input_path)
+        writer = PdfWriter()
+        writer.append_pages_from_reader(reader)
+        writer.encrypt(password)
+
+        out_filename = f"protected_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'wb') as f_out:
+            writer.write(f_out)
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/unlock', methods=['POST'])
+def unlock_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    password = request.form.get('password', '')
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+
+    try:
+        reader = PdfReader(input_path)
+        
+        if reader.is_encrypted:
+            success = reader.decrypt(password)
+            if not success:
+                return jsonify({'error': 'Incorrect password. Could not decrypt PDF.'}), 400
+                
+        writer = PdfWriter()
+        writer.append_pages_from_reader(reader)
+
+        out_filename = f"unlocked_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'wb') as f_out:
+            writer.write(f_out)
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/watermark', methods=['POST'])
+def watermark_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    text = request.form.get('text', 'i loves pdf')
+    try:
+        opacity = float(request.form.get('opacity', 0.3))
+        opacity = max(0.0, min(opacity, 1.0))
+    except ValueError:
+        opacity = 0.3
+        
+    try:
+        rotation = int(request.form.get('rotation', 45))
+    except ValueError:
+        rotation = 45
+
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+
+    try:
+        reader = PdfReader(input_path)
+        writer = PdfWriter()
+
+        for page in reader.pages:
+            box = page.cropbox
+            width = float(box.width)
+            height = float(box.height)
+            
+            # Generate watermark overlay PDF in memory matching page dimensions
+            packet = io.BytesIO()
+            can = canvas.Canvas(packet, pagesize=(width, height))
+            can.setFont("Helvetica", 40)
+            can.setFillColorRGB(0.7, 0.7, 0.7, alpha=opacity)
+            can.saveState()
+            
+            # Center in page dynamically
+            can.translate(width / 2, height / 2)
+            can.rotate(rotation)
+            can.drawCentredString(0, 0, text)
+            can.restoreState()
+            can.save()
+            packet.seek(0)
+            
+            watermark_reader = PdfReader(packet)
+            watermark_page = watermark_reader.pages[0]
+            
+            page.merge_page(watermark_page)
+            writer.add_page(page)
+
+        out_filename = f"watermarked_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'wb') as f_out:
+            writer.write(f_out)
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/page_numbers', methods=['POST'])
+def add_page_numbers():
+    file = (request.files.get('file') or request.files.get('files'))
+    position = request.form.get('position', 'bottom-right') # bottom-left, bottom-center, bottom-right, top-left, top-center, top-right
+    try:
+        start_num = int(request.form.get('start_number', 1))
+    except ValueError:
+        start_num = 1
+    
+    label_format = request.form.get('format', 'Page {n}') # e.g. "Page {n}" or "{n}"
+
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+
+    try:
+        reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+        writer = PdfWriter()
+
+        for idx in range(total_pages):
+            page = reader.pages[idx]
+            
+            # Check cropbox size of the page
+            box = page.cropbox
+            width = float(box.width)
+            height = float(box.height)
+            
+            # Generate overlay page number PDF
+            packet = io.BytesIO()
+            can = canvas.Canvas(packet, pagesize=(width, height))
+            can.setFont("Helvetica", 10)
+            can.setFillColorRGB(0.3, 0.3, 0.3)
+            
+            num_text = label_format.replace('{n}', str(start_num + idx))
+            
+            # Determine x, y based on margin and size
+            margin = 36
+            if 'top' in position:
+                y = height - margin
+            else:
+                y = margin
+                
+            if 'left' in position:
+                x = margin
+                can.drawString(x, y, num_text)
+            elif 'center' in position:
+                x = width / 2
+                can.drawCentredString(x, y, num_text)
+            else: # right
+                x = width - margin
+                can.drawRightString(x, y, num_text)
+                
+            can.save()
+            packet.seek(0)
+            
+            number_pdf = PdfReader(packet)
+            page.merge_page(number_pdf.pages[0])
+            writer.add_page(page)
+
+        out_filename = f"numbered_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'wb') as f_out:
+            writer.write(f_out)
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/organize', methods=['POST'])
+def organize_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    order_str = request.form.get('order')  # comma-separated 0-based index list e.g. "0,2,1"
+    rotations_str = request.form.get('rotations') # comma-separated angles e.g. "90,0,180"
+    
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    if not order_str:
+        return jsonify({'error': 'Page ordering config is required.'}), 400
+
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+
+    try:
+        reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+        
+        try:
+            indices = [int(i.strip()) for i in order_str.split(',') if i.strip()]
+        except ValueError:
+            return jsonify({'error': 'Invalid page ordering format.'}), 400
+
+        rotations = []
+        if rotations_str:
+            try:
+                rotations = [int(r.strip()) for r in rotations_str.split(',') if r.strip()]
+            except ValueError:
+                pass
+
+        writer = PdfWriter()
+        for idx_in_list, idx in enumerate(indices):
+            if 0 <= idx < total_pages:
+                page = writer.add_page(reader.pages[idx])
+                if rotations and idx_in_list < len(rotations):
+                    angle = rotations[idx_in_list]
+                    if angle in [90, 180, 270, 360, -90, -180, -270]:
+                        page.rotate(angle)
+
+        out_filename = f"organized_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'wb') as f_out:
+            writer.write(f_out)
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/word_to_pdf', methods=['POST'])
+def word_to_pdf():
+    try:
+        saved_paths = process_upload((request.files.get('file') or request.files.get('files')), ['.doc', '.docx'])
+        input_path = saved_paths[0]
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+        # Load the Word document
+        doc = Document(input_path)
+        
+        # Build ReportLab elements
+        out_filename = f"converted_word_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        
+        pdf_doc = SimpleDocTemplate(out_path, pagesize=letter,
+                                    rightMargin=72, leftMargin=72,
+                                    topMargin=72, bottomMargin=72)
+        
+        styles = getSampleStyleSheet()
+        
+        # Create a clean normal style
+        normal_style = ParagraphStyle(
+            name='WordNormal',
+            parent=styles['Normal'],
+            fontName='Helvetica',
+            fontSize=11,
+            leading=14,
+            spaceAfter=8
+        )
+        
+        heading1_style = ParagraphStyle(
+            name='WordHeading1',
+            parent=styles['Heading1'],
+            fontName='Helvetica-Bold',
+            fontSize=18,
+            leading=22,
+            spaceAfter=12,
+            spaceBefore=12
+        )
+        
+        story = []
+        
+        from reportlab.platypus import Table as RLTable, TableStyle as RLTableStyle
+        from reportlab.lib import colors
+        
+        for item in iter_block_items(doc):
+            if isinstance(item, DocxParagraph):
+                text = item.text.strip()
+                if not text:
+                    story.append(Spacer(1, 10))
+                    continue
+                
+                style = normal_style
+                if item.style and item.style.name:
+                    if item.style.name.startswith('Heading 1'):
+                        style = heading1_style
+                    elif item.style.name.startswith('Heading'):
+                        style = ParagraphStyle(
+                            name='WordHeadingSub',
+                            parent=styles['Heading2'],
+                            fontName='Helvetica-Bold',
+                            fontSize=14,
+                            leading=18,
+                            spaceAfter=10,
+                            spaceBefore=10
+                        )
+                
+                safe_text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                story.append(Paragraph(safe_text, style))
+            elif isinstance(item, DocxTable):
+                table_data = []
+                for row in item.rows:
+                    row_data = []
+                    for cell in row.cells:
+                        cell_text = "\n".join([p.text.strip() for p in cell.paragraphs if p.text.strip()])
+                        safe_cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        row_data.append(Paragraph(safe_cell_text or ' ', normal_style))
+                    table_data.append(row_data)
+                
+                if table_data:
+                    rl_table = RLTable(table_data, colWidths=None)
+                    rl_table.setStyle(RLTableStyle([
+                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+                        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+                        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+                        ('TOPPADDING', (0,0), (-1,-1), 6),
+                        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+                        ('LEFTPADDING', (0,0), (-1,-1), 6),
+                        ('RIGHTPADDING', (0,0), (-1,-1), 6),
+                    ]))
+                    story.append(rl_table)
+                    story.append(Spacer(1, 12))
+            
+        # Build PDF file
+        pdf_doc.build(story)
+
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+# --- New PDF Tools API ---
+
+@app.route('/api/pdf_to_word', methods=['POST'])
+def pdf_to_word():
+    try:
+        saved_paths = process_upload((request.files.get('file') or request.files.get('files')), ['.pdf'])
+        input_path = saved_paths[0]
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+        doc = fitz.open(input_path)
+        word_doc = Document()
+        
+        for page in doc:
+            blocks = page.get_text("blocks")
+            blocks.sort(key=lambda b: (b[1], b[0]))
+            for block in blocks:
+                block_text = block[4].strip()
+                if block_text:
+                    paragraph_text = " ".join([line.strip() for line in block_text.split("\n") if line.strip()])
+                    word_doc.add_paragraph(paragraph_text)
+        
+        out_filename = f"converted_pdf_{uuid.uuid4().hex[:8]}.docx"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        word_doc.save(out_path)
+        doc.close()
+        
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/html_to_pdf', methods=['POST'])
+def html_to_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    html_code = request.form.get('html_code', '')
+
+    html_content = ""
+    if file and file.filename != '':
+        # Read uploaded file
+        try:
+            html_content = file.read().decode('utf-8')
+        except Exception as e:
+            return jsonify({'error': f'Failed to read HTML file: {str(e)}'}), 400
+    else:
+        html_content = html_code
+
+    if not html_content.strip():
+        return jsonify({'error': 'HTML content or file is required.'}), 400
+
+    out_filename = f"html_pdf_{uuid.uuid4().hex[:8]}.pdf"
+    out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+
+    try:
+        # Attempt conversion via fitz HTML support
+        doc = fitz.open("html", html_content)
+        pdf_bytes = doc.convert_to_pdf()
+        with open(out_path, 'wb') as f_out:
+            f_out.write(pdf_bytes)
+        doc.close()
+    except Exception as fitz_err:
+        # Fallback to reportlab custom parser
+        try:
+            pdf_doc = SimpleDocTemplate(out_path, pagesize=letter)
+            styles = getSampleStyleSheet()
+            normal_style = ParagraphStyle(
+                name='HTMLNormal',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=11,
+                leading=14,
+                spaceAfter=8
+            )
+            parser = ReportLabHTMLParser(styles, normal_style)
+            parser.feed(html_content)
+            parser.flush()
+            if not parser.story:
+                parser.story.append(Paragraph("Empty Document", normal_style))
+            pdf_doc.build(parser.story)
+        except Exception as rl_err:
+            return jsonify({'error': f'PDF conversion failed: {str(fitz_err)} | Fallback: {str(rl_err)}'}), 500
+
+    return jsonify({'download_url': f'/download/{out_filename}'})
+
+@app.route('/api/extract_text', methods=['POST'])
+def extract_text():
+    try:
+        saved_paths = process_upload((request.files.get('file') or request.files.get('files')), ['.pdf'])
+        input_path = saved_paths[0]
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    try:
+        doc = fitz.open(input_path)
+        text_content = ""
+        for page in doc:
+            text_content += page.get_text() + "\n"
+        
+        out_filename = f"extracted_{uuid.uuid4().hex[:8]}.txt"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'w', encoding='utf-8') as f_out:
+            f_out.write(text_content)
+        doc.close()
+        
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/delete_pages', methods=['POST'])
+def delete_pdf_pages():
+    file = (request.files.get('file') or request.files.get('files'))
+    pages_str = request.form.get('pages', '')
+    
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    if not pages_str:
+        return jsonify({'error': 'Pages to delete configuration is required.'}), 400
+
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+
+    try:
+        reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+        
+        # Parse ranges to delete
+        deleted_indices = set()
+        parts = [p.strip() for p in pages_str.split(',') if p.strip()]
+        for part in parts:
+            if '-' in part:
+                start_s, end_s = part.split('-', 1)
+                start = int(start_s) if start_s.strip() else 1
+                if end_s.lower() == 'end' or not end_s.strip():
+                    end = total_pages
+                else:
+                    end = int(end_s)
+                for p in range(min(start, end), max(start, end) + 1):
+                    if 1 <= p <= total_pages:
+                        deleted_indices.add(p - 1)
+            else:
+                p = int(part)
+                if 1 <= p <= total_pages:
+                    deleted_indices.add(p - 1)
+        
+        if len(deleted_indices) >= total_pages:
+            return jsonify({'error': 'Cannot delete all pages from the PDF.'}), 400
+            
+        writer = PdfWriter()
+        for idx in range(total_pages):
+            if idx not in deleted_indices:
+                writer.add_page(reader.pages[idx])
+                
+        out_filename = f"deleted_pages_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        with open(out_path, 'wb') as f_out:
+            writer.write(f_out)
+            
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+# --- File Serving and Downloads ---
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    filename = os.path.basename(filename)
+    file_path = os.path.join(PROCESSED_FOLDER, filename)
+    if os.path.exists(file_path):
+        return send_from_directory(PROCESSED_FOLDER, filename, as_attachment=True)
+    else:
+        return "File not found or expired.", 404
+
+@app.route('/compare-pdf')
+def compare_pdf_redirect():
+    return serve_tool_page('compare-pdf', None)
+
+# --- Technical SEO and Crawl Control ---
+
+@app.route('/robots.txt')
+def serve_robots():
+    return send_from_directory(BASE_DIR, 'robots.txt', mimetype='text/plain')
+
+@app.route('/sitemap.xml')
+@app.route('/sitemap-<path:suffix>.xml')
+def serve_sitemap(suffix=None):
+    filename = f'sitemap-{suffix}.xml' if suffix else 'sitemap.xml'
+    return send_from_directory(BASE_DIR, filename, mimetype='application/xml')
+
+@app.route('/sitemaps/<path:filename>')
+def serve_sitemaps_folder(filename):
+    return send_from_directory(os.path.join(BASE_DIR, 'sitemaps'), filename, mimetype='application/xml')
+
+
+@app.after_request
+def add_header(response):
+    path = request.path
+    if (path.endswith('.css') or path.endswith('.js') or 
+        path.endswith('.png') or path.endswith('.jpg') or 
+        path.endswith('.svg') or path.endswith('.webp') or 
+        path.endswith('.ico') or path.endswith('.woff2')):
+        response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    else:
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return response
+
+@app.route('/api/powerpoint_to_pdf', methods=['POST'])
+def powerpoint_to_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PowerPoint file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pptx'))
+    file.save(input_path)
+    try:
+        out_filename = f"converted_pptx_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        convert_pptx_to_pdf(input_path, out_path)
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/pdf_to_powerpoint', methods=['POST'])
+def pdf_to_powerpoint():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+    try:
+        out_filename = f"converted_pdf_{uuid.uuid4().hex[:8]}.pptx"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        convert_pdf_to_pptx(input_path, out_path)
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/excel_to_pdf', methods=['POST'])
+def excel_to_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'Excel file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('xlsx'))
+    file.save(input_path)
+    try:
+        out_filename = f"converted_xlsx_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        convert_excel_to_pdf(input_path, out_path)
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/pdf_to_excel', methods=['POST'])
+def pdf_to_excel():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+    try:
+        out_filename = f"converted_pdf_{uuid.uuid4().hex[:8]}.xlsx"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        convert_pdf_to_excel(input_path, out_path)
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/pdf_to_pdfa', methods=['POST'])
+def pdf_to_pdfa():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+    try:
+        out_filename = f"archived_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        try:
+            doc = fitz.open(input_path)
+            doc.save(out_path, pdfa=True)
+            doc.close()
+        except Exception:
+            shutil.copy(input_path, out_path)
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/repair_pdf', methods=['POST'])
+def repair_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+    try:
+        out_filename = f"repaired_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        doc = fitz.open(input_path)
+        doc.save(out_path, garbage=4, deflate=True, clean=True)
+        doc.close()
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/ocr_pdf', methods=['POST'])
+def ocr_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+    try:
+        out_filename = f"ocr_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        run_ocr_on_pdf(input_path, out_path)
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/pdf_summarize', methods=['POST'])
+def pdf_summarize():
+    file = (request.files.get('file') or request.files.get('files'))
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+    try:
+        out_filename = f"summary_{uuid.uuid4().hex[:8]}.txt"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        summarize_pdf_document(input_path, out_path)
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/translate_pdf', methods=['POST'])
+def translate_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    target_lang = request.form.get('target_lang', 'es')
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+    try:
+        out_filename = f"translated_{target_lang}_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        translate_pdf_document(input_path, out_path, target_lang)
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/api/sign_pdf', methods=['POST'])
+def sign_pdf():
+    file = (request.files.get('file') or request.files.get('files'))
+    sig_b64 = request.form.get('signature_base64')
+    try:
+        page_idx = int(request.form.get('page_index', 0))
+        left = float(request.form.get('left', 0.0))
+        top = float(request.form.get('top', 0.0))
+        width = float(request.form.get('width', 150.0))
+        height = float(request.form.get('height', 60.0))
+    except ValueError:
+        return jsonify({'error': 'Invalid placement coordinates.'}), 400
+    if not file or file.filename == '':
+        return jsonify({'error': 'PDF file is required.'}), 400
+    if not sig_b64:
+        return jsonify({'error': 'Signature image is required.'}), 400
+    input_path = os.path.join(UPLOAD_FOLDER, get_unique_filename('pdf'))
+    file.save(input_path)
+    try:
+        import base64
+        img_bytes = base64.b64decode(sig_b64)
+        out_filename = f"signed_{uuid.uuid4().hex[:8]}.pdf"
+        out_path = os.path.join(PROCESSED_FOLDER, out_filename)
+        doc = fitz.open(input_path)
+        page = doc[page_idx]
+        rect = fitz.Rect(left, top, left + width, top + height)
+        page.insert_image(rect, stream=img_bytes)
+        doc.save(out_path)
+        doc.close()
+        return jsonify({'download_url': f'/download/{out_filename}'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.remove(input_path)
+        except:
+            pass
+
+@app.route('/ads/<path:filename>')
+def serve_ad_snippets(filename):
+    return send_from_directory(os.path.join(BASE_DIR, 'ads'), filename)
+
+@app.route('/<path:slug>')
+def generate_unique_keyword_content(keyword, lang='en'):
+    clean_title = keyword.replace('-', ' ').title().replace('100 Free', '100% Free')
+    kw_lower = keyword.lower()
+    
+    is_mac = 'mac' in kw_lower
+    is_win = 'windows' in kw_lower or 'pc' in kw_lower
+    is_mobile = 'mobile' in kw_lower or 'android' in kw_lower or 'iphone' in kw_lower
+    is_no_watermark = 'no-watermark' in kw_lower or 'without-watermark' in kw_lower
+    is_no_reg = 'without-registration' in kw_lower or 'no-signup' in kw_lower or 'no-login' in kw_lower
+    is_fast = 'fast' in kw_lower or 'instant' in kw_lower or 'quick' in kw_lower
+    
+    card1_title = "100% Free & Unlimited"
+    card1_desc = f"Use {clean_title} as many times as you need without any hidden fees, subscriptions, or document limits."
+    
+    if is_mac:
+        card2_title = "Optimized for macOS & Safari"
+        card2_desc = f"{clean_title} runs directly inside Safari, Chrome, or Firefox on macOS without installing third-party software."
+    elif is_win:
+        card2_title = "Windows Compatible"
+        card2_desc = f"{clean_title} works seamlessly across Windows 10, 11, and legacy PC web browsers without software setup."
+    elif is_mobile:
+        card2_title = "Mobile Responsive Engine"
+        card2_desc = f"{clean_title} is fully optimized for iOS and Android mobile browsers for on-the-go document processing."
+    elif is_no_watermark:
+        card2_title = "Zero Watermark Guarantee"
+        card2_desc = f"Your processed documents are output cleanly with no added watermarks, branding, or unwanted stamps."
+    else:
+        card2_title = "Guaranteed Privacy & SSL"
+        card2_desc = f"All files uploaded to {clean_title} are processed over encrypted SSL connections and permanently deleted within 15 minutes."
+        
+    if is_fast:
+        card3_title = "Lightning Fast Speed"
+        card3_desc = f"Powered by high-performance cloud servers to execute {clean_title} in seconds."
+    elif is_no_reg:
+        card3_title = "No Registration Required"
+        card3_desc = f"Start using {clean_title} immediately without creating an account or providing email address details."
+    else:
+        card3_title = "Full Resolution Output"
+        card3_desc = f"Preserves original layouts, embedded fonts, image resolution, and formatting throughout processing."
+
+    step1 = f"Select or drag & drop your files into the {clean_title} upload area."
+    step2 = f"Adjust options or configure settings tailored for {clean_title}."
+    step3 = f"Click the process button to start performing {clean_title}."
+    step4 = f"Download your processed document directly to your device."
+    
+    faq1_q = f"How do I use {clean_title} online?"
+    faq1_a = f"To use {clean_title}, simply upload your files to the tool above, select your desired configuration options, and click process to download your output file."
+    
+    faq2_q = f"Is {clean_title} completely free?"
+    faq2_a = f"Yes, {clean_title} is 100% free with no hidden subscription costs, watermarks, or account registration requirements."
+    
+    faq3_q = f"Are my files secure when using {clean_title}?"
+    faq3_a = f"Absolute security is guaranteed. All uploads to {clean_title} are encrypted via SSL and automatically purged from our servers within 15 minutes."
+    
+    if lang and lang != 'en':
+        base_lang = lang.lower().split('-')[0]
+        card1_title = translate_seo_metadata_cached(card1_title, base_lang)
+        card1_desc = translate_seo_metadata_cached(card1_desc, base_lang)
+        card2_title = translate_seo_metadata_cached(card2_title, base_lang)
+        card2_desc = translate_seo_metadata_cached(card2_desc, base_lang)
+        card3_title = translate_seo_metadata_cached(card3_title, base_lang)
+        card3_desc = translate_seo_metadata_cached(card3_desc, base_lang)
+        
+        step1 = translate_seo_metadata_cached(step1, base_lang)
+        step2 = translate_seo_metadata_cached(step2, base_lang)
+        step3 = translate_seo_metadata_cached(step3, base_lang)
+        step4 = translate_seo_metadata_cached(step4, base_lang)
+        
+        faq1_q = translate_seo_metadata_cached(faq1_q, base_lang)
+        faq1_a = translate_seo_metadata_cached(faq1_a, base_lang)
+        faq2_q = translate_seo_metadata_cached(faq2_q, base_lang)
+        faq2_a = translate_seo_metadata_cached(faq2_a, base_lang)
+        faq3_q = translate_seo_metadata_cached(faq3_q, base_lang)
+        faq3_a = translate_seo_metadata_cached(faq3_a, base_lang)
+
+    html_block = f'''
+        <section class="seo-content-section">
+            <h2 class="seo-title">{clean_title}</h2>
+            <p class="seo-intro">{faq1_a}</p>
+
+            <div class="seo-grid">
+                <div class="seo-card">
+                    <h3 class="seo-card-title">
+                        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                        {card1_title}
+                    </h3>
+                    <p class="seo-card-desc">{card1_desc}</p>
+                </div>
+                <div class="seo-card">
+                    <h3 class="seo-card-title">
+                        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                        {card2_title}
+                    </h3>
+                    <p class="seo-card-desc">{card2_desc}</p>
+                </div>
+                <div class="seo-card">
+                    <h3 class="seo-card-title">
+                        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                        {card3_title}
+                    </h3>
+                    <p class="seo-card-desc">{card3_desc}</p>
+                </div>
+            </div>
+
+            <div class="seo-steps-section">
+                <h3 class="seo-steps-title">How to use {clean_title}</h3>
+                <div class="seo-steps-list">
+                    <div class="seo-step-item">
+                        <div class="seo-step-num">1</div>
+                        <div class="seo-step-text">
+                            <h4>Step 1</h4>
+                            <p>{step1}</p>
+                        </div>
+                    </div>
+                    <div class="seo-step-item">
+                        <div class="seo-step-num">2</div>
+                        <div class="seo-step-text">
+                            <h4>Step 2</h4>
+                            <p>{step2}</p>
+                        </div>
+                    </div>
+                    <div class="seo-step-item">
+                        <div class="seo-step-num">3</div>
+                        <div class="seo-step-text">
+                            <h4>Step 3</h4>
+                            <p>{step3}</p>
+                        </div>
+                    </div>
+                    <div class="seo-step-item">
+                        <div class="seo-step-num">4</div>
+                        <div class="seo-step-text">
+                            <h4>Step 4</h4>
+                            <p>{step4}</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="seo-faq-section">
+                <h3 class="seo-steps-title">Frequently Asked Questions</h3>
+                <div class="seo-faq-list">
+                    <div class="seo-faq-item">
+                        <h4 class="seo-faq-question">{faq1_q}</h4>
+                        <p class="seo-faq-answer">{faq1_a}</p>
+                    </div>
+                    <div class="seo-faq-item">
+                        <h4 class="seo-faq-question">{faq2_q}</h4>
+                        <p class="seo-faq-answer">{faq2_a}</p>
+                    </div>
+                    <div class="seo-faq-item">
+                        <h4 class="seo-faq-question">{faq3_q}</h4>
+                        <p class="seo-faq-answer">{faq3_a}</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+    '''
+    
+    faq_schema = f'''
+    <script type="application/ld+json">
+    {{
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+            {{
+                "@type": "Question",
+                "name": "{faq1_q}",
+                "acceptedAnswer": {{
+                    "@type": "Answer",
+                    "text": "{faq1_a}"
+                }}
+            }},
+            {{
+                "@type": "Question",
+                "name": "{faq2_q}",
+                "acceptedAnswer": {{
+                    "@type": "Answer",
+                    "text": "{faq2_a}"
+                }}
+            }},
+            {{
+                "@type": "Question",
+                "name": "{faq3_q}",
+                "acceptedAnswer": {{
+                    "@type": "Answer",
+                    "text": "{faq3_a}"
+                }}
+            }}
+        ]
+    }}
+    </script>
+    '''
+    
+    return html_block, faq_schema
+
+def dynamic_seo_page(slug):
+    slug = slug.strip('/')
+    
+    # If the slug is actually a tool slug (like a legacy typo) that wasn't matched by specific routes
+    if slug in SLUG_TO_FILE or slug in LEGACY_REDIRECTS:
+        return serve_tool_page(slug)
+        
+    # Handle dynamic real working language/locale routes
+    if is_valid_language_code(slug):
+        index_path = os.path.join(BASE_DIR, 'index.html')
+        with open(index_path, 'r', encoding='utf-8') as f:
+            html = f.read()
+        return apply_language_translations(html, slug)
+        
+    # Parse language from slug (e.g. "es/100-free-add-logo-to-pdf")
+    lang = None
+    parts = slug.split('/')
+    if len(parts) == 2 and is_valid_language_code(parts[0]):
+        lang = parts[0]
+        keyword = parts[1]
+    else:
+        keyword = slug
+        
+    # Handle SEO keyword pages dynamically (e.g. from seo_keywords.txt)
+    if keyword in SEO_KEYWORDS or keyword.startswith('100-free-') or keyword.endswith('-for-mac') or keyword.endswith('-for-windows'):
+        clean_title_h1, title, desc = get_seo_metadata(keyword, lang)
+        
+        # Determine the correct tool template based on the keyword to ensure unique structure
+        base_template = get_base_tool_for_seo_keyword(keyword)
+        filepath = os.path.join(BASE_DIR, base_template)
+        if not os.path.exists(filepath):
+            abort(404)
+            
+        with open(filepath, 'r', encoding='utf-8') as f:
+            html = f.read()
+            
+        # Inject dynamic SEO tags
+        import re
+        root_domain = "https://ilovespdfs.in"
+        lang_sub = f"{lang}/" if lang and lang != 'en' else "en/"
+        canonical_url = f"{root_domain}/{lang_sub}{keyword}"
+        
+        html = re.sub(r'<title>.*?</title>', f'<title>{title}</title>', html, flags=re.IGNORECASE)
+        html = re.sub(r'<meta name="description" content=".*?">', f'<meta name="description" content="{desc}">', html, flags=re.IGNORECASE)
+        html = re.sub(r'<link\s+rel=["\']canonical["\'].*?>', '', html, flags=re.IGNORECASE)
+        
+        # Build hreflangs for keyword pages
+        hreflangs = []
+        hreflangs.append(f'<link rel="canonical" href="{canonical_url}" />')
+        hreflangs.append(f'<link rel="alternate" hreflang="x-default" href="{root_domain}/en/{keyword}" />')
+        hreflangs.append(f'<link rel="alternate" hreflang="en" href="{root_domain}/en/{keyword}" />')
+        indian_langs_set = {'hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ur', 'pa', 'ml', 'or'}
+        for l in SUPPORTED_LANGS:
+            if l != 'en':
+                hreflangs.append(f'<link rel="alternate" hreflang="{l}" href="{root_domain}/{l}/{keyword}" />')
+                if l in indian_langs_set:
+                    hreflangs.append(f'<link rel="alternate" hreflang="{l}-in" href="{root_domain}/{l}/{keyword}" />')
+        
+        injection = "\n    ".join(hreflangs)
+        html = re.sub(r'(<head\b[^>]*>)', r'\1\n    ' + injection, html, flags=re.IGNORECASE)
+        
+        # The translated clean_title_h1 is retrieved from get_seo_metadata
+        
+        if base_template == 'index.html':
+            # Replace the homepage H1 and P tags dynamically
+            html = re.sub(
+                r'<h1 class="hero-title[^>]*>.*?</h1>', 
+                f'<h1 class="hero-title">{clean_title_h1}</h1>', 
+                html, 
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            html = re.sub(
+                r'<p class="hero-subtitle[^>]*>.*?</p>', 
+                f'<p class="hero-subtitle">{desc}</p>', 
+                html, 
+                flags=re.IGNORECASE | re.DOTALL
+            )
+        else:
+            # Replace the specific tool template's header container with an H1
+            html = re.sub(
+                r'<div class="tool-header-info">.*?</div>',
+                f'<div class="tool-header-info">\n                <h1>{clean_title_h1}</h1>\n                <p>{desc}</p>\n            </div>',
+                html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+        
+        # Generate 100% unique features, steps, FAQs and Schema for this keyword
+        unique_html_block, faq_schema = generate_unique_keyword_content(keyword, lang)
+        
+        # Replace the static .seo-content-section in the template with our 100% unique section
+        html = re.sub(r'<section class="seo-content-section">.*?</section>', unique_html_block, html, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Inject FAQ Schema before </head>
+        html = re.sub(r'(</head>)', faq_schema + r'\n\1', html, flags=re.IGNORECASE)
+
+        # Fix CSS paths for nested routes
+        html = html.replace('href="./style.css', 'href="/style.css')
+        
+        # Inject Advanced JSON-LD for SoftwareApplication (if exists)
+        schema = f'''
+    <script type="application/ld+json">
+    {{
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "{title}",
+        "description": "{desc}",
+        "url": "{canonical_url}",
+        "applicationCategory": "UtilitiesApplication",
+        "operatingSystem": "All",
+        "offers": {{
+            "@type": "Offer",
+            "price": "0",
+            "priceCurrency": "USD"
+        }}
+    }}
+    </script>
+'''
+        html = re.sub(r'(</head>)', schema + r'\n\1', html, flags=re.IGNORECASE)
+        
+        # Translate the UI buttons/menus to the requested language using fast in-memory mapping
+        if lang and lang != 'en':
+            html = apply_language_translations(html, lang)
+            
+        html = inject_seo_internal_links(html, keyword, lang)
+        return html
+
+        
+    # Allow serving static files or explicit HTML from root
+    root_file = os.path.join(BASE_DIR, slug)
+    if os.path.exists(root_file) and os.path.isfile(root_file):
+        return send_from_directory(BASE_DIR, slug)
+        
+    if not slug.endswith('.html'):
+        html_file = os.path.join(BASE_DIR, slug + '.html')
+        if os.path.exists(html_file) and os.path.isfile(html_file):
+            return send_from_directory(BASE_DIR, slug + '.html')
+    
+    abort(404)
+
+import hashlib
+import random
+
+@lru_cache(maxsize=1)
+def get_sorted_seo_keywords():
+    return sorted(list(SEO_KEYWORDS))
+
+def inject_seo_internal_links(html, current_slug, lang=None):
+    if not SEO_KEYWORDS:
+        return html
+        
+    seed_str = current_slug if current_slug else "home"
+    seed = int(hashlib.md5(seed_str.encode('utf-8')).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+    
+    sorted_keywords = get_sorted_seo_keywords()
+    sample_size = min(15, len(sorted_keywords))
+    selected_keywords = rng.sample(sorted_keywords, sample_size)
+    
+    lang_sub = f"{lang}/" if lang and lang != 'en' else ""
+    
+    links_html = []
+    for kw in selected_keywords:
+        url = f"/{lang_sub}{kw}"
+        clean_kw = kw.replace('-', ' ').title().replace('100 Free', '100% Free')
+        links_html.append(f'<a href="{url}" class="seo-internal-link">{clean_kw}</a>')
+        
+    title_text = "Popular PDF Searches"
+    if lang and lang != 'en':
+        base_lang = lang.lower().split('-')[0]
+        title_text = INSTRUCTION_TRANSLATIONS.get(base_lang, {}).get('Popular PDF Searches', title_text)
+        
+    cluster_html = f'''
+    <section class="seo-internal-links-container" style="max-width: 1200px; margin: 40px auto; padding: 20px; text-align: center; border-top: 1px solid #eaeaea;">
+        <h3 style="margin-bottom: 20px; color: #333; font-size: 1.2rem; font-weight: 600;">{title_text}</h3>
+        <div style="display: flex; flex-wrap: wrap; justify-content: center; gap: 10px;">
+            {"".join(links_html)}
+        </div>
+        <style>
+            .seo-internal-link {{
+                padding: 8px 16px;
+                background-color: #fff;
+                border: 1px solid #e0e0e0;
+                border-radius: 20px;
+                color: #555;
+                text-decoration: none;
+                font-size: 0.9rem;
+                transition: all 0.2s ease-in-out;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+            }}
+            .seo-internal-link:hover {{
+                background-color: #f8f9fa;
+                color: #000;
+                border-color: #d0d0d0;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+                transform: translateY(-1px);
+            }}
+        </style>
+    </section>
+    '''
+    
+    if '<footer>' in html:
+        return html.replace('<footer>', cluster_html + '\n<footer>')
+    elif '</main>' in html:
+        return html.replace('</main>', cluster_html + '\n</main>')
+    else:
+        return html + cluster_html
+
+def get_base_tool_for_seo_keyword(slug):
+    slug_lower = slug.lower()
+    
+    mapping_rules = {
+        'watermark.html': ['watermark', 'add-logo'],
+        'page-numbers.html': ['page-number', 'paginate'],
+        'delete-pages.html': ['delete-page', 'remove-page'],
+        'rotate.html': ['rotate'],
+        'protect.html': ['protect', 'encrypt', 'add-password'],
+        'unlock.html': ['unlock', 'decrypt', 'remove-password', 'remove-security'],
+        'pdf-to-pdfa.html': ['pdfa', 'archive'],
+        'pdf-summarize.html': ['summarize', 'summary', 'ai-pdf'],
+        'translate-pdf.html': ['translate', 'translator'],
+        'sign-pdf.html': ['sign', 'signature'],
+        'compare.html': ['compare'],
+        'ocr-pdf.html': ['ocr', 'text-recognition'],
+        'extract-text.html': ['extract-text', 'text-extractor'],
+        'repair-pdf.html': ['repair', 'fix', 'recover'],
+        'word-to-pdf.html': ['word-to-pdf', 'doc-to-pdf', 'docx-to-pdf'],
+        'pdf-to-word.html': ['pdf-to-word', 'pdf-to-doc', 'pdf-to-docx'],
+        'powerpoint-to-pdf.html': ['powerpoint-to-pdf', 'ppt-to-pdf'],
+        'pdf-to-powerpoint.html': ['pdf-to-powerpoint', 'pdf-to-ppt'],
+        'excel-to-pdf.html': ['excel-to-pdf', 'xls-to-pdf'],
+        'pdf-to-excel.html': ['pdf-to-excel', 'pdf-to-xls'],
+        'jpg-to-pdf.html': ['jpg-to-pdf', 'jpeg-to-pdf', 'image-to-pdf', 'png-to-pdf'],
+        'pdf-to-jpg.html': ['pdf-to-jpg', 'pdf-to-jpeg', 'pdf-to-image', 'pdf-to-png'],
+        'html-to-pdf.html': ['html-to-pdf', 'web-to-pdf'],
+        'merge.html': ['merge', 'combine', 'join', 'bind'],
+        'split.html': ['split', 'separate', 'divide']
+    }
+    
+    for tool_html, keywords in mapping_rules.items():
+        if any(kw in slug_lower for kw in keywords):
+            return tool_html
+            
+    return 'index.html'
+
+
+@lru_cache(maxsize=10000)
+def translate_seo_metadata_cached(text, target_lang):
+    if not target_lang or target_lang == 'en':
+        return text
+    try:
+        base_lang = target_lang.split('-')[0]
+        return GoogleTranslator(source='en', target=base_lang).translate(text)
+    except:
+        return text
+
+def get_seo_metadata(slug, lang='en'):
+    clean_title = slug.replace('-', ' ').title().replace('100 Free', '100% Free')
+    title = f"{clean_title} | Premium PDF processing"
+    desc = f"Looking for {clean_title}? Use our Premium, free online tool to process your documents instantly. No registration required."
+    
+    if lang and lang != 'en':
+        clean_title = translate_seo_metadata_cached(clean_title, lang)
+        title = translate_seo_metadata_cached(title, lang)
+        desc = translate_seo_metadata_cached(desc, lang)
+        
+    return clean_title, title, desc
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+
+
+
+# Master Multi-Language Translation Map
+DYNAMIC_LANG_MAP = {'es': {'title': 'i loves pdf | Herramientas PDF gratuitas en línea', 'h1': 'Todas las herramientas PDF que necesitas en un solo lugar', 'desc': 'Todas las herramientas PDF al alcance de tu mano. 100% GRATIS y fáciles de usar. Une, divide, comprime, convierte, rota, desbloquea y añade marcas de agua a tus archivos PDF con solo unos pocos clics.', 'all': 'Todos', 'org': 'Organizar PDF', 'opt': 'Optimizar PDF', 'conv': 'Convertir PDF', 'sec': 'Seguridad PDF', 'intel': 'Inteligencia PDF', 'merge': 'Unir PDF', 'split': 'Dividir PDF', 'compress': 'Comprimir PDF', 'w2p': 'Word a PDF', 'p2w': 'PDF a Word', 'p2pp': 'PDF a PowerPoint', 'p2ex': 'PDF a Excel', 'pp2p': 'PowerPoint a PDF', 'ex2p': 'Excel a PDF', 'j2p': 'JPG a PDF', 'p2j': 'PDF a JPG', 'rot': 'Rotar PDF', 'prot': 'Proteger PDF', 'unl': 'Desbloquear PDF', 'wm': 'Marca de agua', 'pn': 'Números de página', 'h2p': 'HTML a PDF', 'txt': 'Extraer texto', 'del': 'Eliminar páginas', 'pdfa': 'PDF a PDF/A', 'rep': 'Reparar PDF', 'ocr': 'OCR PDF', 'ai': 'Resumidor de IA', 'trans': 'Traducir PDF', 'sign': 'Firmar PDF', 'comp': 'Comparar PDF', 'login': 'Iniciar sesión', 'signup': 'Registrarse', 'home': 'Inicio', 'all_tools': 'Todas las herramientas PDF', 'convert_pdf': 'Convertir PDF'}, 'fr': {'title': 'i loves pdf | Outils PDF gratuits en ligne', 'h1': 'Tous les outils PDF dont vous avez besoin au même endroit', 'desc': 'Tous les outils PDF à portée de main. 100% GRATUITS et faciles à utiliser ! Fusionnez, divisez, compressez, convertissez, pivotez, déverrouillez et ajoutez un filigrane à vos PDFs en quelques clics.', 'all': 'Tous', 'org': 'Organiser PDF', 'opt': 'Optimiser PDF', 'conv': 'Convertir PDF', 'sec': 'Sécurité PDF', 'intel': 'Intelligence PDF', 'merge': 'Fusionner PDF', 'split': 'Diviser PDF', 'compress': 'Compresser PDF', 'w2p': 'Word en PDF', 'p2w': 'PDF en Word', 'p2pp': 'PDF en PowerPoint', 'p2ex': 'PDF en Excel', 'pp2p': 'PowerPoint en PDF', 'ex2p': 'Excel en PDF', 'j2p': 'JPG en PDF', 'p2j': 'PDF en JPG', 'rot': 'Pivoter PDF', 'prot': 'Protéger PDF', 'unl': 'Déverrouiller PDF', 'wm': 'Filigrane', 'pn': 'Numérotation', 'h2p': 'HTML en PDF', 'txt': 'Extraire le texte', 'del': 'Supprimer des pages', 'pdfa': 'PDF en PDF/A', 'rep': 'Réparer PDF', 'ocr': 'OCR PDF', 'ai': 'Résumeur IA', 'trans': 'Traduire PDF', 'sign': 'Signer PDF', 'comp': 'Comparer PDF', 'login': 'Connexion', 'signup': "S'inscrire", 'home': 'Accueil', 'all_tools': 'Tous les outils PDF', 'convert_pdf': 'Convertir PDF'}, 'de': {'title': 'i loves pdf | Kostenlose Online-PDF-Werkzeuge', 'h1': 'Jedes PDF-Werkzeug, das Sie benötigen, an einem Ort', 'desc': 'Alle PDF-Werkzeuge für Sie bereit. 100% KOSTENLOS und einfach zu bedienen! PDF-Dateien zusammenfügen, teilen, komprimieren, konvertieren, drehen, entsperren und Wasserzeichen hinzufügen.', 'all': 'Alle', 'org': 'PDF organisieren', 'opt': 'PDF optimieren', 'conv': 'PDF konvertieren', 'sec': 'PDF-Sicherheit', 'intel': 'PDF-Intelligenz', 'merge': 'PDF zusammenfügen', 'split': 'PDF teilen', 'compress': 'PDF komprimieren', 'w2p': 'Word in PDF', 'p2w': 'PDF in Word', 'p2pp': 'PDF in PowerPoint', 'p2ex': 'PDF in Excel', 'pp2p': 'PowerPoint in PDF', 'ex2p': 'Excel in PDF', 'j2p': 'JPG in PDF', 'p2j': 'PDF in JPG', 'rot': 'PDF drehen', 'prot': 'PDF schützen', 'unl': 'PDF entsperren', 'wm': 'Wasserzeichen', 'pn': 'Seitenzahlen', 'h2p': 'HTML in PDF', 'txt': 'Text extrahieren', 'del': 'Seiten löschen', 'pdfa': 'PDF in PDF/A', 'rep': 'PDF reparieren', 'ocr': 'OCR PDF', 'ai': 'KI-Zusammenfassung', 'trans': 'PDF übersetzen', 'sign': 'PDF unterschreiben', 'comp': 'PDF vergleichen', 'login': 'Einloggen', 'signup': 'Registrieren', 'home': 'Startseite', 'all_tools': 'Alle PDF-Werkzeuge', 'convert_pdf': 'PDF konvertieren'}, 'pt': {'title': 'i loves pdf | Ferramentas PDF online gratuitas', 'h1': 'Todas as ferramentas PDF necessárias em um só lugar', 'desc': "Todas as ferramentas PDF ao seu alcance. 100% GRATUITAS e fáceis de usar! Mesclar, dividir, comprimir, converter, rotacionar, desbloquear e adicionar marcas d'água aos seus PDFs.", 'all': 'Todos', 'org': 'Organizar PDF', 'opt': 'Otimizar PDF', 'conv': 'Converter PDF', 'sec': 'Segurança PDF', 'intel': 'Inteligência PDF', 'merge': 'Mesclar PDF', 'split': 'Dividir PDF', 'compress': 'Comprimir PDF', 'w2p': 'Word para PDF', 'p2w': 'PDF para Word', 'p2pp': 'PDF para PowerPoint', 'p2ex': 'PDF para Excel', 'pp2p': 'PowerPoint para PDF', 'ex2p': 'Excel para PDF', 'j2p': 'JPG para PDF', 'p2j': 'PDF para JPG', 'rot': 'Rotacionar PDF', 'prot': 'Proteger PDF', 'unl': 'Desbloquear PDF', 'wm': "Marca d'água", 'pn': 'Números de página', 'h2p': 'HTML para PDF', 'txt': 'Extrair texto', 'del': 'Excluir páginas', 'pdfa': 'PDF para PDF/A', 'rep': 'Reparar PDF', 'ocr': 'OCR PDF', 'ai': 'Resumidor de IA', 'trans': 'Traduzir PDF', 'sign': 'Assinar PDF', 'comp': 'Comparar PDF', 'login': 'Entrar', 'signup': 'Cadastrar', 'home': 'Início', 'all_tools': 'Todas as ferramentas PDF', 'convert_pdf': 'Converter PDF'}, 'hi': {'title': 'i loves pdf | मुफ़्त ऑनलाइन पीडीएफ उपकरण', 'h1': 'पीडीएफ पर काम करने के लिए सभी आवश्यक उपकरण एक जगह', 'desc': 'आपकी उंगलियों पर सभी पीडीएफ उपकरण। 100% मुफ़्त और उपयोग में आसान! कुछ ही क्लिक में पीडीएफ़ को मर्ज, स्प्लिट, कंप्रेस, कन्वर्ट, रोटेट, अनलॉक और वॉटरमार्क करें।', 'all': 'सभी', 'org': 'पीडीएफ व्यवस्थित करें', 'opt': 'पीडीएफ ऑप्टिमाइज़ करें', 'conv': 'पीडीएफ कन्वर्ट करें', 'sec': 'पीडीएफ सुरक्षा', 'intel': 'पीडीएफ इंटेलिजेंस', 'merge': 'पीडीएफ मर्ज करें', 'split': 'पीडीएफ विभाजित करें', 'compress': 'पीडीएफ कंप्रेस करें', 'w2p': 'वर्ड से पीडीएफ', 'p2w': 'पीडीएफ से वर्ड', 'p2pp': 'पीडीएफ से पावरपॉइंट', 'p2ex': 'पीडीएफ से एक्सेल', 'pp2p': 'पावरपॉइंट से पीडीएफ', 'ex2p': 'एक्सेल से पीडीएफ', 'j2p': 'जेपीजी से पीडीएफ', 'p2j': 'पीडीएफ से जेपीजी', 'rot': 'पीडीएफ घुमाएँ', 'prot': 'पीडीएफ सुरक्षित करें', 'unl': 'पीडीएफ अनलॉक करें', 'wm': 'वॉटरमार्क', 'pn': 'पेज नंबर', 'h2p': 'एचटीएमएल से पीडीएफ', 'txt': 'टेक्स्ट निकालें', 'del': 'पेजएं हटाएं', 'pdfa': 'पीडीएफ से पीडीएफ/ए', 'rep': 'पीडीएफ रिपेयर करें', 'ocr': 'ओसीआर पीडीएफ', 'ai': 'एआई सारांश', 'trans': 'अनुवाद करें', 'sign': 'हस्ताक्षर करें', 'comp': 'पीडीएफ तुलना करें', 'login': 'लॉगिन', 'signup': 'साइन अप', 'home': 'होम', 'all_tools': 'सभी पीडीएफ टूल्स', 'convert_pdf': 'कन्वर्ट पीडीएफ'}, 'ar': {'title': 'i loves pdf | أدوات PDF مجانية عبر الإنترنت', 'h1': 'جميع أدوات PDF التي تحتاجها في مكان واحد', 'desc': 'جميع أدوات PDF بين يديك. مجانية 100% وسهلة الاستخدام! دمج وتقسيم وضغط وتحويل وتدوير وحماية وحذف صفحات PDF بنقرات قليلة.', 'all': 'الكل', 'org': 'تنظيم PDF', 'opt': 'تحسين PDF', 'conv': 'تحويل PDF', 'sec': 'أمان PDF', 'intel': 'ذكاء PDF', 'merge': 'دمج PDF', 'split': 'تقسيم PDF', 'compress': 'ضغط PDF', 'w2p': 'Word إلى PDF', 'p2w': 'PDF إلى Word', 'p2pp': 'PDF إلى PowerPoint', 'p2ex': 'PDF إلى Excel', 'pp2p': 'PowerPoint إلى PDF', 'ex2p': 'Excel إلى PDF', 'j2p': 'JPG إلى PDF', 'p2j': 'PDF إلى JPG', 'rot': 'تدوير PDF', 'prot': 'حماية PDF', 'unl': 'فتح PDF', 'wm': 'علامة مائية', 'pn': 'أرقام الصفحات', 'h2p': 'HTML إلى PDF', 'txt': 'استخراج النص', 'del': 'حذف الصفحات', 'pdfa': 'PDF إلى PDF/A', 'rep': 'إصلاح PDF', 'ocr': 'التعرف الضوئي', 'ai': 'ملخص الذكاء الاصطناعي', 'trans': 'ترجمة PDF', 'sign': 'توقيع PDF', 'comp': 'مقارنة PDF', 'login': 'تسجيل الدخول', 'signup': 'إنشاء حساب', 'home': 'الرئيسية', 'all_tools': 'جميع أدوات PDF', 'convert_pdf': 'تحويل PDF'}, 'zh': {'title': 'i loves pdf | 免费在线 PDF 工具', 'h1': '您在一个地方所需的所有 PDF 工具', 'desc': '所有 PDF 工具触手可及。100% 免费且易于使用！只需点击几下即可合并、拆分、压缩、转换、旋转、解锁和加水印 PDF。', 'all': '全部', 'org': '组织 PDF', 'opt': '优化 PDF', 'conv': '转换 PDF', 'sec': 'PDF 安全', 'intel': 'PDF 智能', 'merge': '合并 PDF', 'split': '拆分 PDF', 'compress': '压缩 PDF', 'w2p': 'Word 转 PDF', 'p2w': 'PDF 转 Word', 'p2pp': 'PDF 转 PowerPoint', 'p2ex': 'PDF 转 Excel', 'pp2p': 'PowerPoint 转 PDF', 'ex2p': 'Excel 转 PDF', 'j2p': 'JPG 转 PDF', 'p2j': 'PDF 转 JPG', 'rot': '旋转 PDF', 'prot': '加密 PDF', 'unl': '解密 PDF', 'wm': '添加水印', 'pn': '添加页码', 'h2p': 'HTML 转 PDF', 'txt': '提取文本', 'del': '删除页面', 'pdfa': 'PDF 转 PDF/A', 'rep': '修复 PDF', 'ocr': 'OCR 识别', 'ai': 'AI 摘要', 'trans': '翻译 PDF', 'sign': '电子签名', 'comp': '对比 PDF', 'login': '登录', 'signup': '注册', 'home': '首页', 'all_tools': '所有 PDF 工具', 'convert_pdf': '转换 PDF'}, 'ja': {'title': 'i loves pdf | 無料のオンライン PDF ツール', 'h1': 'PDFの作業に必要なすべてのツールを1箇所に', 'desc': 'すべてのPDFツールが手元に。100%無料で使いやすい！数クリックでPDFの結合、分割、圧縮、変換、回転、保護解除が可能です。', 'all': 'すべて', 'org': 'PDF 整理', 'opt': 'PDF 最適化', 'conv': 'PDF 変換', 'sec': 'PDF セキュリティ', 'intel': 'PDF インテリジェンス', 'merge': 'PDF 結合', 'split': 'PDF 分割', 'compress': 'PDF 圧縮', 'w2p': 'Word から PDF', 'p2w': 'PDF から Word', 'p2pp': 'PDF から PowerPoint', 'p2ex': 'PDF から Excel', 'pp2p': 'PowerPoint から PDF', 'ex2p': 'Excel から PDF', 'j2p': 'JPG から PDF', 'p2j': 'PDF から JPG', 'rot': 'PDF 回転', 'prot': 'PDF 保護', 'unl': 'PDF ロック解除', 'wm': '透かし追加', 'pn': 'ページ番号', 'h2p': 'HTML から PDF', 'txt': 'テキスト抽出', 'del': 'ページ削除', 'pdfa': 'PDF から PDF/A', 'rep': 'PDF 修復', 'ocr': 'OCR 処理', 'ai': 'AI 要約', 'trans': 'PDF 翻訳', 'sign': 'PDF 署名', 'comp': 'PDF 比較', 'login': 'ログイン', 'signup': '新規登録', 'home': 'ホーム', 'all_tools': 'すべての PDF ツール', 'convert_pdf': 'PDF 変換'}, 'ru': {'title': 'i loves pdf | Бесплатные онлайн-инструменты PDF', 'h1': 'Все инструменты PDF, необходимые для работы, в одном месте', 'desc': 'Все инструменты PDF у вас под рукой. 100% БЕСПЛАТНО и просто в использовании! Объединяйте, разделяйте, сжимайте, конвертируйте, поворачивайте и защищайте PDF в несколько кликов.', 'all': 'Все', 'org': 'Упорядочить PDF', 'opt': 'Оптимизировать PDF', 'conv': 'Конвертировать PDF', 'sec': 'Безопасность PDF', 'intel': 'Интеллект PDF', 'merge': 'Объединить PDF', 'split': 'Разделить PDF', 'compress': 'Сжать PDF', 'w2p': 'Word в PDF', 'p2w': 'PDF в Word', 'p2pp': 'PDF в PowerPoint', 'p2ex': 'PDF в Excel', 'pp2p': 'PowerPoint в PDF', 'ex2p': 'Excel в PDF', 'j2p': 'JPG в PDF', 'p2j': 'PDF в JPG', 'rot': 'Повернуть PDF', 'prot': 'Защитить PDF', 'unl': 'Снять защиту PDF', 'wm': 'Водяной знак', 'pn': 'Номера страниц', 'h2p': 'HTML в PDF', 'txt': 'Извлечь текст', 'del': 'Удалить страницы', 'pdfa': 'PDF в PDF/A', 'rep': 'Восстановить PDF', 'ocr': 'Распознавание OCR', 'ai': 'ИИ Суммаризатор', 'trans': 'Перевести PDF', 'sign': 'Подписать PDF', 'comp': 'Сравнить PDF', 'login': 'Войти', 'signup': 'Регистрация', 'home': 'Главная', 'all_tools': 'Все инструменты PDF', 'convert_pdf': 'Конвертировать PDF'}, 'it': {'title': 'i loves pdf | Strumenti PDF online gratuiti', 'h1': 'Tutti gli strumenti PDF di cui hai bisogno in un unico posto', 'desc': 'Tutti gli strumenti PDF a portata di mano. 100% GRATUITI e facili da usare! Unisci, dividi, comprimi, converti, ruota e sblocca i tuoi PDF in pochi clic.', 'all': 'Tutti', 'org': 'Organizza PDF', 'opt': 'Ottimizza PDF', 'conv': 'Converti PDF', 'sec': 'Sicurezza PDF', 'intel': 'Intelligenza PDF', 'merge': 'Unisci PDF', 'split': 'Dividi PDF', 'compress': 'Comprimi PDF', 'w2p': 'Da Word a PDF', 'p2w': 'Da PDF a Word', 'p2pp': 'Da PDF a PowerPoint', 'p2ex': 'Da PDF ad Excel', 'pp2p': 'Da PowerPoint a PDF', 'ex2p': 'Da Excel a PDF', 'j2p': 'Da JPG a PDF', 'p2j': 'Da PDF a JPG', 'rot': 'Ruota PDF', 'prot': 'Proteggi PDF', 'unl': 'Sblocca PDF', 'wm': 'Filigrana', 'pn': 'Numeri di pagina', 'h2p': 'Da HTML a PDF', 'txt': 'Estrai testo', 'del': 'Elimina pagine', 'pdfa': 'Da PDF a PDF/A', 'rep': 'Ripara PDF', 'ocr': 'OCR PDF', 'ai': 'Riepilogo IA', 'trans': 'Traduci PDF', 'sign': 'Firma PDF', 'comp': 'Confronta PDF', 'login': 'Accedi', 'signup': 'Registrati', 'home': 'Home', 'all_tools': 'Tutti gli strumenti PDF', 'convert_pdf': 'Converti PDF'}}
+
+INDIAN_LANGS = {
+    'hi': {
+        'title': 'i loves pdf | मुफ़्त ऑनलाइन पीडीएफ उपकरण (भारत)', 
+        'h1': 'पीडीएफ पर काम करने के लिए सभी आवश्यक उपकरण एक जगह', 
+        'desc': 'आपकी उंगलियों पर सभी पीडीएफ उपकरण। 100% मुफ़्त और उपयोग में आसान! भारत में कुछ ही क्लिक में पीडीएफ़ को मर्ज, स्प्लिट, कंप्रेस, कन्वर्ट, रोटेट, अनलॉक और वॉटरमार्क करें।', 
+        'all': 'सभी', 'org': 'पीडीएफ व्यवस्थित करें', 'opt': 'पीडीएफ ऑप्टिमाइज़ करें', 'conv': 'पीडीएफ कन्वर्ट करें', 'sec': 'पीडीएफ सुरक्षा', 'intel': 'पीडीएफ इंटेलिजेंस', 
+        'merge': 'पीडीएफ मर्ज करें', 'split': 'पीडीएफ विभाजित करें', 'compress': 'पीडीएफ कंप्रेस करें', 'w2p': 'वर्ड से पीडीएफ', 'p2w': 'पीडीएफ से वर्ड', 'p2pp': 'पीडीएफ से पावरपॉइंट', 
+        'p2ex': 'पीडीएफ से एक्सेल', 'pp2p': 'पावरपॉइंट से पीडीएफ', 'ex2p': 'एक्सेल से पीडीएफ', 'j2p': 'जेपीजी से पीडीएफ', 'p2j': 'पीडीएफ से जेपीजी', 'rot': 'पीडीएफ घुमाएँ', 
+        'prot': 'पीडीएफ सुरक्षित करें', 'unl': 'पीडीएफ अनलॉक करें', 'wm': 'वॉटरमार्क', 'pn': 'पेज नंबर', 'h2p': 'एचटीएमएल से पीडीएफ', 'txt': 'टेक्स्ट निकालें', 'del': 'पेज हटाएं', 
+        'pdfa': 'पीडीएफ से पीडीएफ/ए', 'rep': 'पीडीएफ रिपेयर करें', 'ocr': 'ओसीआर पीडीएफ', 'ai': 'एआई सारांश', 'trans': 'अनुवाद करें', 'sign': 'हस्ताक्षर करें', 'comp': 'पीडीएफ तुलना करें', 
+        'login': 'लॉगिन', 'signup': 'साइन अप', 'home': 'होम', 'all_tools': 'सभी पीडीएफ टूल्स', 'convert_pdf': 'कन्वर्ट पीडीएफ'
+    },
+    'bn': {
+        'title': 'i loves pdf | বিনামূল্যে অনলাইন পিডিএফ টুলস (ভারত)', 
+        'h1': 'আপনার প্রয়োজনীয় সমস্ত পিডিএফ টুলস এক জায়গায়', 
+        'desc': 'আপনার নখদর্পণে সমস্ত পিডিএফ টুলস। ১০০% বিনামূল্যে এবং সহজে ব্যবহারযোগ্য! ভারতে মাত্র কয়েকটি ক্লিকে পিডিএফ মার্জ, স্প্লিট, কম্প্রেস, রূপান্তর, আনলক করুন।', 
+        'all': 'সব', 'org': 'পিডিএফ সাজান', 'opt': 'পিডিএফ অপ্টিমাইজ করুন', 'conv': 'পিডিএফ রূপান্তর', 'sec': 'পিডিএফ নিরাপত্তা', 'intel': 'পিডিএফ বুদ্ধিমত্তা', 
+        'merge': 'পিডিএফ মার্জ করুন', 'split': 'পিডিএফ স্প্লিট করুন', 'compress': 'পিডিএফ কম্প্রেস করুন', 'w2p': 'ওয়ার্ড থেকে পিডিএফ', 'p2w': 'পিডিএফ থেকে ওয়ার্ড', 'p2pp': 'পিডিএফ থেকে পাওয়ারপয়েন্ট', 
+        'p2ex': 'পিডিএফ থেকে এক্সেল', 'pp2p': 'পাওয়ারপয়েন্ট থেকে পিডিএফ', 'ex2p': 'এক্সেল থেকে পিডিএফ', 'j2p': 'জেপিজি থেকে পিডিএফ', 'p2j': 'পিডিএফ থেকে জেপিজি', 'rot': 'পিডিএফ ঘোরান', 
+        'prot': 'পিডিএফ সুরক্ষিত করুন', 'unl': 'পিডিএফ আনলক করুন', 'wm': 'ওয়াটারমার্ক', 'pn': 'পৃষ্ঠা নম্বর', 'h2p': 'এইচটিএমএল থেকে পিডিএফ', 'txt': 'টেক্সট বের করুন', 'del': 'পৃষ্ঠা মুছুন', 
+        'pdfa': 'পিডিএফ থেকে পিডিএফ/এ', 'rep': 'পিডিএফ মেরামত করুন', 'ocr': 'ওসিআর পিডিএফ', 'ai': 'এআই সারাংশ', 'trans': 'পিডিএফ অনুবাদ করুন', 'sign': 'পিডিএফ স্বাক্ষর করুন', 'comp': 'পিডিএফ তুলনা করুন', 
+        'login': 'লগইন', 'signup': 'নিবন্ধন করুন', 'home': 'হোম', 'all_tools': 'সমস্ত পিডিএফ টুলস', 'convert_pdf': 'পিডিএফ রূপান্তর করুন'
+    },
+    'ta': {
+        'title': 'i loves pdf | இலவச ஆன்லைன் PDF கருவிகள் (இந்தியா)', 
+        'h1': 'உங்களுக்குத் தேவையான அனைத்து PDF கருவிகளும் ஒரே இடத்தில்', 
+        'desc': 'உங்கள் விரல் நுனியில் அனைத்து PDF கருவிகள். 100% இலவசம் மற்றும் பயன்படுத்த எளிதானது! இந்தியாவில் PDF களை இணைக்கவும், பிரிக்கவும், சுருக்கவும், மாற்றவும்.', 
+        'all': 'அனைத்தும்', 'org': 'PDF ஒழுங்கமைக்கவும்', 'opt': 'PDF மேம்படுத்தவும்', 'conv': 'PDF மாற்றவும்', 'sec': 'PDF பாதுகாப்பு', 'intel': 'PDF நுண்ணறிவு', 
+        'merge': 'PDF இணைக்கவும்', 'split': 'PDF பிரிக்கவும்', 'compress': 'PDF சுருக்கவும்', 'w2p': 'Word இல் இருந்து PDF', 'p2w': 'PDF இல் இருந்து Word', 'p2pp': 'PDF இல் இருந்து PowerPoint', 
+        'p2ex': 'PDF இல் இருந்து Excel', 'pp2p': 'PowerPoint இல் இருந்து PDF', 'ex2p': 'Excel இல் இருந்து PDF', 'j2p': 'JPG இல் இருந்து PDF', 'p2j': 'PDF இல் இருந்து JPG', 'rot': 'PDF சுழற்றவும்', 
+        'prot': 'PDF பாதுகாக்கவும்', 'unl': 'PDF திறக்கவும்', 'wm': 'வாட்டர்மார்க்', 'pn': 'பக்க எண்கள்', 'h2p': 'HTML இல் இருந்து PDF', 'txt': 'உரையைப் பிரித்தெடுக்கவும்', 'del': 'பக்கங்களை நீக்கவும்', 
+        'pdfa': 'PDF இல் இருந்து PDF/A', 'rep': 'PDF சரிசெய்யவும்', 'ocr': 'OCR PDF', 'ai': 'AI சுருக்கம்', 'trans': 'PDF மொழிபெயர்க்கவும்', 'sign': 'PDF கையொப்பமிடவும்', 'comp': 'PDF ஒப்பிடவும்', 
+        'login': 'உள்நுழைய', 'signup': 'பதிவு செய்க', 'home': 'முகப்பு', 'all_tools': 'அனைத்து PDF கருவிகள்', 'convert_pdf': 'PDF மாற்றவும்'
+    },
+    'te': {
+        'title': 'i loves pdf | ఉచిత ఆన్‌లైన్ PDF సాధనాలు (భారతదేశం)', 
+        'h1': 'మీకు కావలసిన అన్ని PDF సాధనాలు ఒకే చోట', 
+        'desc': 'మీ చేతివేళ్ల వద్ద అన్ని PDF సాధనాలు. 100% ఉచితం మరియు ఉపయోగించడానికి సులభం! భారతదేశంలో PDF లను విలీనం చేయండి, విభజించండి, కుదించండి మరియు మార్చండి.', 
+        'all': 'అన్నీ', 'org': 'PDF నిర్వహించండి', 'opt': 'PDF ఆప్టిమైజ్ చేయండి', 'conv': 'PDF మార్చండి', 'sec': 'PDF భద్రత', 'intel': 'PDF ఇంటెలిజెన్స్', 
+        'merge': 'PDF విలీనం చేయండి', 'split': 'PDF విభజించండి', 'compress': 'PDF కుదించండి', 'w2p': 'Word నుండి PDF', 'p2w': 'PDF నుండి Word', 'p2pp': 'PDF నుండి PowerPoint', 
+        'p2ex': 'PDF నుండి Excel', 'pp2p': 'PowerPoint నుండి PDF', 'ex2p': 'Excel నుండి PDF', 'j2p': 'JPG నుండి PDF', 'p2j': 'PDF నుండి JPG', 'rot': 'PDF తిప్పండి', 
+        'prot': 'PDF రక్షించండి', 'unl': 'PDF అన్‌లాక్ చేయండి', 'wm': 'వాటర్‌మార్క్', 'pn': 'పేజీ సంఖ్యలు', 'h2p': 'HTML నుండి PDF', 'txt': 'వచనాన్ని సంగ్రహించండి', 'del': 'పేజీలను తొలగించండి', 
+        'pdfa': 'PDF నుండి PDF/A', 'rep': 'PDF మరమ్మతు', 'ocr': 'OCR PDF', 'ai': 'AI సారాంశం', 'trans': 'PDF అనువదించండి', 'sign': 'PDF సంతకం చేయండి', 'comp': 'PDF సరిపోల్చండి', 
+        'login': 'లాగిన్', 'signup': 'సైన్ అప్', 'home': 'హోమ్', 'all_tools': 'అన్ని PDF సాధనాలు', 'convert_pdf': 'PDF మార్చండి'
+    },
+    'mr': {
+        'title': 'i loves pdf | मोफत ऑनलाइन पीडीएफ टूल्स (भारत)', 
+        'h1': 'तुम्हाला आवश्यक असलेली सर्व पीडीएफ टूल्स एकाच ठिकाणी', 
+        'desc': 'तुमच्या बोटांच्या टोकावर सर्व पीडीएफ टूल्स. 100% मोफत आणि वापरण्यास सोपे! भारतात पीडीएफ एकत्र करा, विभाजित करा, संकुचित करा आणि रूपांतरित करा.', 
+        'all': 'सर्व', 'org': 'पीडीएफ आयोजित करा', 'opt': 'पीडीएफ ऑप्टिमाइझ करा', 'conv': 'पीडीएफ रूपांतरित करा', 'sec': 'पीडीएफ सुरक्षा', 'intel': 'पीडीएफ बुद्धिमत्ता', 
+        'merge': 'पीडीएफ एकत्र करा', 'split': 'पीडीएफ विभाजित करा', 'compress': 'पीडीएफ संकुचित करा', 'w2p': 'वर्ड ते पीडीएफ', 'p2w': 'पीडीएफ ते वर्ड', 'p2pp': 'पीडीएफ ते पॉवरपॉइंट', 
+        'p2ex': 'पीडीएफ ते एक्सेल', 'pp2p': 'पॉवरपॉइंट ते पीडीएफ', 'ex2p': 'एक्सेल ते पीडीएफ', 'j2p': 'जेपीजी ते पीडीएफ', 'p2j': 'पीडीएफ ते जेपीजी', 'rot': 'पीडीएफ फिरवा', 
+        'prot': 'पीडीएफ सुरक्षित करा', 'unl': 'पीडीएफ अनलॉक करा', 'wm': 'वॉटरमार्क', 'pn': 'पृष्ठ क्रमांक', 'h2p': 'एचटीएमएल ते पीडीएफ', 'txt': 'मजकूर काढा', 'del': 'पृष्ठे हटवा', 
+        'pdfa': 'पीडीएफ ते पीडीएफ/ए', 'rep': 'पीडीएफ दुरुस्त करा', 'ocr': 'ओसीआर पीडीएफ', 'ai': 'एआय सारांश', 'trans': 'पीडीएफ भाषांतरित करा', 'sign': 'पीडीएफ स्वाक्षरी करा', 'comp': 'पीडीएफ तुलना करा', 
+        'login': 'लॉगिन', 'signup': 'साइन अप', 'home': 'होम', 'all_tools': 'सर्व पीडीएफ टूल्स', 'convert_pdf': 'पीडीएफ रूपांतरित करा'
+    },
+    'gu': {
+        'title': 'i loves pdf | મફત ઓનલાઈન પીડીએફ ટૂલ્સ (ભારત)', 
+        'h1': 'તમને જોઈતા તમામ પીડીએફ ટૂલ્સ એક જ જગ્યાએ', 
+        'desc': 'તમારી આંગળીના વેઢે તમામ પીડીએફ ટૂલ્સ. 100% મફત અને ઉપયોગમાં સરળ! ભારતમાં પીડીએફ મર્જ કરો, વિભાજીત કરો, સંકુચિત કરો અને કન્વર્ટ કરો.', 
+        'all': 'બધા', 'org': 'પીડીએફ ગોઠવો', 'opt': 'પીડીએફ ઓપ્ટિમાઇઝ કરો', 'conv': 'પીડીએફ કન્વર્ટ કરો', 'sec': 'પીડીએફ સુરક્ષા', 'intel': 'પીડીએફ બુદ્ધિ', 
+        'merge': 'પીડીએફ મર્જ કરો', 'split': 'પીડીએફ વિભાજીત કરો', 'compress': 'પીડીએફ સંકુચિત કરો', 'w2p': 'વર્ડ થી પીડીએફ', 'p2w': 'પીડીએફ થી વર્ડ', 'p2pp': 'પીડીએફ થી પાવરપોઈન્ટ', 
+        'p2ex': 'પીડીએફ થી એક્સેલ', 'pp2p': 'પાવરપોઈન્ટ થી પીડીએફ', 'ex2p': 'એક્સેલ થી પીડીએફ', 'j2p': 'જેપીજી થી પીડીએફ', 'p2j': 'પીડીએફ થી જેપીજી', 'rot': 'પીડીએફ ફેરવો', 
+        'prot': 'પીડીએફ સુરક્ષિત કરો', 'unl': 'પીડીએફ અનલૉક કરો', 'wm': 'વોટરમાર્ક', 'pn': 'પૃષ્ઠ નંબરો', 'h2p': 'એચટીએમએલ થી પીડીએફ', 'txt': 'ટેક્સ્ટ કાઢો', 'del': 'પૃષ્ઠો કાઢી નાખો', 
+        'pdfa': 'પીડીએફ થી પીડીએફ/એ', 'rep': 'પીડીએફ રિપેર કરો', 'ocr': 'ઓસીઆર પીડીએફ', 'ai': 'એઆઈ સારાંશ', 'trans': 'પીડીએફ અનુવાદ કરો', 'sign': 'પીડીએફ સહી કરો', 'comp': 'પીડીએફ સરખામણી કરો', 
+        'login': 'લોગિન', 'signup': 'સાઇન અપ', 'home': 'હોમ', 'all_tools': 'તમામ પીડીએફ ટૂલ્સ', 'convert_pdf': 'પીડીએફ કન્વર્ટ કરો'
+    },
+    'kn': {
+        'title': 'i loves pdf | ಉಚಿತ ಆನ್‌ಲೈನ್ PDF ಪರಿಕರಗಳು (ಭಾರತ)', 
+        'h1': 'ನಿಮಗೆ ಅಗತ್ಯವಿರುವ ಎಲ್ಲಾ PDF ಪರಿಕರಗಳು ಒಂದೇ ಸ್ಥಳದಲ್ಲಿ', 
+        'desc': 'ನಿಮ್ಮ ಬೆರಳ ತುದಿಯಲ್ಲಿ ಎಲ್ಲಾ PDF ಪರಿಕರಗಳು. 100% ಉಚಿತ ಮತ್ತು ಬಳಸಲು ಸುಲಭ! ಭಾರತದಲ್ಲಿ PDF ಗಳನ್ನು ವಿಲೀನಗೊಳಿಸಿ, ವಿಭಜಿಸಿ, ಕುಗ್ಗಿಸಿ ಮತ್ತು ಪರಿವರ್ತಿಸಿ.', 
+        'all': 'ಎಲ್ಲಾ', 'org': 'PDF ಆಯೋಜಿಸಿ', 'opt': 'PDF ಆಪ್ಟಿಮೈಜ್ ಮಾಡಿ', 'conv': 'PDF ಪರಿವರ್ತಿಸಿ', 'sec': 'PDF ಭದ್ರತೆ', 'intel': 'PDF ಬುದ್ಧಿವಂತಿಕೆ', 
+        'merge': 'PDF ವಿಲೀನಗೊಳಿಸಿ', 'split': 'PDF ವಿಭಜಿಸಿ', 'compress': 'PDF ಕುಗ್ಗಿಸಿ', 'w2p': 'Word ನಿಂದ PDF', 'p2w': 'PDF ನಿಂದ Word', 'p2pp': 'PDF ನಿಂದ PowerPoint', 
+        'p2ex': 'PDF ನಿಂದ Excel', 'pp2p': 'PowerPoint ನಿಂದ PDF', 'ex2p': 'Excel ನಿಂದ PDF', 'j2p': 'JPG ನಿಂದ PDF', 'p2j': 'PDF ನಿಂದ JPG', 'rot': 'PDF ತಿರುಗಿಸಿ', 
+        'prot': 'PDF ರಕ್ಷಿಸಿ', 'unl': 'PDF ಅನ್‌ಲಾಕ್ ಮಾಡಿ', 'wm': 'ವಾಟರ್‌ಮಾರ್ಕ್', 'pn': 'ಪುಟ ಸಂಖ್ಯೆಗಳು', 'h2p': 'HTML ನಿಂದ PDF', 'txt': 'ಪಠ್ಯವನ್ನು ಹೊರತೆಗೆಯಿರಿ', 'del': 'ಪುಟಗಳನ್ನು ಅಳಿಸಿ', 
+        'pdfa': 'PDF ನಿಂದ PDF/A', 'rep': 'PDF ದುರಸ್ತಿ ಮಾಡಿ', 'ocr': 'OCR PDF', 'ai': 'AI ಸಾರಾಂಶ', 'trans': 'PDF ಭಾಷಾಂತರಿಸಿ', 'sign': 'PDF ಸಹಿ ಮಾಡಿ', 'comp': 'PDF ಹೋಲಿಕೆ ಮಾಡಿ', 
+        'login': 'ಲಾಗಿನ್', 'signup': 'ಸೈನ್ ಅಪ್', 'home': 'ಮುಖಪುಟ', 'all_tools': 'ಎಲ್ಲಾ PDF ಪರಿಕರಗಳು', 'convert_pdf': 'PDF ಪರಿವರ್ತಿಸಿ'
+    },
+    'ur': {
+        'title': 'i loves pdf | مفت آن لائن پی ڈی ایف ٹولز (بھارت)', 
+        'h1': 'آپ کی ضرورت کے تمام پی ڈی ایف ٹولز ایک ہی جگہ پر', 
+        'desc': 'آپ کی انگلیوں پر تمام پی ڈی ایف ٹولز۔ 100% مفت اور استعمال میں آسان! بھارت میں پی ڈی ایف کو ضم، تقسیم، کمپریس اور تبدیل کریں۔', 
+        'all': 'تمام', 'org': 'پی ڈی ایف کو منظم کریں', 'opt': 'پی ڈی ایف کو بہتر بنائیں', 'conv': 'پی ڈی ایف کو تبدیل کریں', 'sec': 'پی ڈی ایف سیکیورٹی', 'intel': 'پی ڈی ایف انٹیلی جنس', 
+        'merge': 'پی ڈی ایف ضم کریں', 'split': 'پی ڈی ایف تقسیم کریں', 'compress': 'پی ڈی ایف کمپریس کریں', 'w2p': 'ورڈ سے پی ڈی ایف', 'p2w': 'پی ڈی ایف سے ورڈ', 'p2pp': 'پی ڈی ایف سے پاورپوائنٹ', 
+        'p2ex': 'پی ڈی ایف سے ایکسل', 'pp2p': 'پاورپوائنٹ سے پی ڈی ایف', 'ex2p': 'ایکسل سے پی ڈی ایف', 'j2p': 'جے پی جی سے پی ڈی ایف', 'p2j': 'پی ڈی ایف سے جے پی جی', 'rot': 'پی ڈی ایف گھمائیں', 
+        'prot': 'پی ڈی ایف کو محفوظ بنائیں', 'unl': 'پی ڈی ایف ان لاک کریں', 'wm': 'واٹر مارک', 'pn': 'صفحہ نمبر', 'h2p': 'ایچ ٹی ایم ایل سے پی ڈی ایف', 'txt': 'متن نکالیں', 'del': 'صفحات حذف کریں', 
+        'pdfa': 'پی ڈی ایف سے پی ڈی ایف/اے', 'rep': 'پی ڈی ایف کی مرمت', 'ocr': 'او سی آر پی ڈی ایف', 'ai': 'اے آئی خلاصہ', 'trans': 'پی ڈی ایف کا ترجمہ کریں', 'sign': 'پی ڈی ایف پر دستخط کریں', 'comp': 'پی ڈی ایف کا موازنہ کریں', 
+        'login': 'لاگ ان', 'signup': 'سائن اپ', 'home': 'ہوم', 'all_tools': 'تمام پی ڈی ایف ٹولز', 'convert_pdf': 'پی ڈی ایف تبدیل کریں'
+    },
+    'pa': {
+        'title': 'i loves pdf | ਮੁਫ਼ਤ ਆਨਲਾਈਨ PDF ਟੂਲ (ਭਾਰਤ)', 
+        'h1': 'ਤੁਹਾਨੂੰ ਲੋੜੀਂਦੇ ਸਾਰੇ PDF ਟੂਲ ਇੱਕੋ ਥਾਂ \'ਤੇ', 
+        'desc': 'ਤੁਹਾਡੀਆਂ ਉਂਗਲਾਂ \'ਤੇ ਸਾਰੇ PDF ਟੂਲ। 100% ਮੁਫ਼ਤ ਅਤੇ ਵਰਤਣ ਵਿੱਚ ਆਸਾਨ! ਭਾਰਤ ਵਿੱਚ ਕੁਝ ਹੀ ਕਲਿੱਕਾਂ ਨਾਲ PDF ਨੂੰ ਮਿਲਾਓ, ਵੰਡੋ, ਕੰਪ੍ਰੈਸ ਕਰੋ ਅਤੇ ਬਦਲੋ।', 
+        'all': 'ਸਾਰੇ', 'org': 'PDF ਪ੍ਰਬੰਧਿਤ ਕਰੋ', 'opt': 'PDF ਅਨੁਕੂਲਿਤ ਕਰੋ', 'conv': 'PDF ਬਦਲੋ', 'sec': 'PDF ਸੁਰੱਖਿਆ', 'intel': 'PDF ਇੰਟੈਲੀਜੈਂਸ', 
+        'merge': 'PDF ਮਿਲਾਓ', 'split': 'PDF ਵੰਡੋ', 'compress': 'PDF ਕੰਪ੍ਰੈਸ ਕਰੋ', 'w2p': 'Word ਤੋਂ PDF', 'p2w': 'PDF ਤੋਂ Word', 'p2pp': 'PDF ਤੋਂ PowerPoint', 
+        'p2ex': 'PDF ਤੋਂ Excel', 'pp2p': 'PowerPoint ਤੋਂ PDF', 'ex2p': 'Excel ਤੋਂ PDF', 'j2p': 'JPG ਤੋਂ PDF', 'p2j': 'PDF ਤੋਂ JPG', 'rot': 'PDF ਘੁੰਮਾਓ', 
+        'prot': 'PDF ਸੁਰੱਖਿਅਤ ਕਰੋ', 'unl': 'PDF ਅਨਲੌਕ ਕਰੋ', 'wm': 'ਵਾਟਰਮਾਰਕ', 'pn': 'ਪੰਨਾ ਨੰਬਰ', 'h2p': 'HTML ਤੋਂ PDF', 'txt': 'ਟੈਕਸਟ ਕੱਢੋ', 'del': 'ਪੰਨੇ ਮਿਟਾਓ', 
+        'pdfa': 'PDF ਤੋਂ PDF/A', 'rep': 'PDF ਮੁਰੰਮਤ ਕਰੋ', 'ocr': 'OCR PDF', 'ai': 'AI ਸਾਰਾਂਸ਼', 'trans': 'PDF ਅਨੁਵਾਦ ਕਰੋ', 'sign': 'PDF ਦਸਤਖਤ ਕਰੋ', 'comp': 'PDF ਤੁਲਨਾ ਕਰੋ', 
+        'login': 'ਲਾਗਿਨ', 'signup': 'ਸਾਈਨ ਅੱਪ', 'home': 'ਹੋਮ', 'all_tools': 'ਸਾਰੇ PDF ਟੂਲ', 'convert_pdf': 'PDF ਬਦਲੋ'
+    },
+    'ml': {
+        'title': 'i loves pdf | സൗജന്യ ഓൺലൈൻ PDF ടൂളുകൾ (ഇന്ത്യ)', 
+        'h1': 'നിങ്ങൾക്ക് ആവശ്യമായ എല്ലാ PDF ടൂളുകളും ഒരിടത്ത്', 
+        'desc': 'നിങ്ങളുടെ വിരൽത്തുമ്പിൽ എല്ലാ PDF ടൂളുകളും. 100% സൗജന്യവും ഉപയോഗിക്കാൻ എളുപ്പവുമാണ്! ഇന്ത്യയിൽ PDF-കൾ ലയിപ്പിക്കുക, വിഭജിക്കുക, കംപ്രസ് ചെയ്യുക, പരിവർത്തനം ചെയ്യുക.', 
+        'all': 'എല്ലാം', 'org': 'PDF സംഘടിപ്പിക്കുക', 'opt': 'PDF ഒപ്റ്റിമൈസ് ചെയ്യുക', 'conv': 'PDF പരിവർത്തനം ചെയ്യുക', 'sec': 'PDF സുരക്ഷ', 'intel': 'PDF ഇന്റലിജൻസ്', 
+        'merge': 'PDF ലയിപ്പിക്കുക', 'split': 'PDF വിഭജിക്കുക', 'compress': 'PDF കംപ്രസ് ചെയ്യുക', 'w2p': 'Word-ൽ നിന്ന് PDF', 'p2w': 'PDF-ൽ നിന്ന് Word', 'p2pp': 'PDF-ൽ നിന്ന് PowerPoint', 
+        'p2ex': 'PDF-ൽ നിന്ന് Excel', 'pp2p': 'PowerPoint-ൽ നിന്ന് PDF', 'ex2p': 'Excel-ൽ നിന്ന് PDF', 'j2p': 'JPG-ൽ നിന്ന് PDF', 'p2j': 'PDF-ൽ നിന്ന് JPG', 'rot': 'PDF തിരിക്കുക', 
+        'prot': 'PDF സംരക്ഷിക്കുക', 'unl': 'PDF അൺലോക്ക് ചെയ്യുക', 'wm': 'വാട്ടർമാർക്ക്', 'pn': 'പേജ് നമ്പറുകൾ', 'h2p': 'HTML-ൽ നിന്ന് PDF', 'txt': 'വാചകം എക്‌സ്‌ട്രാക്‌റ്റ് ചെയ്യുക', 'del': 'പേജുകൾ ഇല്ലാതാക്കുക', 
+        'pdfa': 'PDF-ൽ നിന്ന് PDF/A', 'rep': 'PDF നന്നാക്കുക', 'ocr': 'OCR PDF', 'ai': 'AI സംഗ്രഹം', 'trans': 'PDF വിവർത്തനം ചെയ്യുക', 'sign': 'PDF ഒപ്പിടുക', 'comp': 'PDF താരതമ്യം ചെയ്യുക', 
+        'login': 'ലോഗിൻ', 'signup': 'സൈൻ അപ്പ്', 'home': 'ഹോം', 'all_tools': 'എല്ലാ PDF ടൂളുകളും', 'convert_pdf': 'PDF പരിവർത്തനം ചെയ്യുക'
+    },
+    'or': {
+        'title': 'i loves pdf | ମାଗଣା ଅନଲାଇନ୍ ପିଡିଏଫ୍ ଟୁଲ୍ସ (ଭାରତ)', 
+        'h1': 'ଆପଣଙ୍କର ସମସ୍ତ ପିଡିଏଫ୍ ଟୁଲ୍ ଗୋଟିଏ ସ୍ଥାନରେ', 
+        'desc': 'ଆପଣଙ୍କ ଆଙ୍ଗୁଠି ଅଗରେ ସମସ୍ତ ପିଡିଏଫ୍ ଟୁଲ୍। ୧୦୦% ମାଗଣା ଏବଂ ବ୍ୟବହାର କରିବାକୁ ସହଜ! ଭାରତରେ ପିଡିଏଫ୍ ମିଶ୍ରଣ, ବିଭାଜନ, ସଙ୍କୋଚନ ଏବଂ ରୂପାନ୍ତର କରନ୍ତୁ।', 
+        'all': 'ସମସ୍ତ', 'org': 'ପିଡିଏଫ୍ ସଜାନ୍ତୁ', 'opt': 'ପିଡିଏଫ୍ ଅପ୍ଟିମାଇଜ୍ କରନ୍ତୁ', 'conv': 'ପିଡିଏଫ୍ ରୂପାନ୍ତର କରନ୍ତୁ', 'sec': 'ପିଡିଏଫ୍ ସୁରକ୍ଷା', 'intel': 'ପିଡିଏଫ୍ ବୁଦ୍ଧିମତା', 
+        'merge': 'ପିଡିଏଫ୍ ମିଶ୍ରଣ କରନ୍ତୁ', 'split': 'ପିଡିଏଫ୍ ବିଭାଜନ କରନ୍ତୁ', 'compress': 'ପିଡିଏଫ୍ ସଙ୍କୋଚନ କରନ୍ତୁ', 'w2p': 'ୱାର୍ଡ ରୁ ପିଡିଏଫ୍', 'p2w': 'ପିଡିଏଫ୍ ରୁ ୱାର୍ଡ', 'p2pp': 'ପିଡିଏଫ୍ ରୁ ପାୱାରପଏଣ୍ଟ', 
+        'p2ex': 'ପିଡିଏଫ୍ ରୁ ଏକ୍ସେଲ', 'pp2p': 'ପାୱାରପଏଣ୍ଟ ରୁ ପିଡିଏଫ୍', 'ex2p': 'ଏକ୍ସେଲ ରୁ ପିଡିଏଫ୍', 'j2p': 'ଜେପିଜି ରୁ ପିଡିଏଫ୍', 'p2j': 'ପିଡିଏଫ୍ ରୁ ଜେପିଜି', 'rot': 'ପିଡିଏଫ୍ ଘୁରାନ୍ତୁ', 
+        'prot': 'ପିଡିଏଫ୍ ସୁରକ୍ଷିତ କରନ୍ତୁ', 'unl': 'ପିଡିଏଫ୍ ଅନଲକ୍ କରନ୍ତୁ', 'wm': 'ୱାଟରମାର୍କ', 'pn': 'ପୃଷ୍ଠା ସଂଖ୍ୟା', 'h2p': 'ଏଚଟିଏମଏଲ ରୁ ପିଡିଏଫ୍', 'txt': 'ଟେକ୍ସଟ ବାହାର କରନ୍ତୁ', 'del': 'ପୃଷ୍ଠା ହଟାନ୍ତୁ', 
+        'pdfa': 'ପିଡିଏଫ୍ ରୁ ପିଡିଏଫ୍/ଏ', 'rep': 'ପିଡିଏଫ୍ ମରାମତି କରନ୍ତୁ', 'ocr': 'ଓସିଆର ପିଡିଏଫ୍', 'ai': 'ଏଆଇ ସାରାଂଶ', 'trans': 'ପିଡିଏଫ୍ ଅନୁବାଦ କରନ୍ତୁ', 'sign': 'ପିଡିଏଫ୍ ସ୍ୱାକ୍ଷର କରନ୍ତୁ', 'comp': 'ପିଡିଏଫ୍ ତୁଳନା କରନ୍ତୁ', 
+        'login': 'ଲଗଇନ୍', 'signup': 'ସାଇନ୍ ଅପ୍', 'home': 'ହୋମ୍', 'all_tools': 'ସମସ୍ତ ପିଡିଏଫ୍ ଟୁଲ୍ସ', 'convert_pdf': 'ପିଡିଏଫ୍ ରୂପାନ୍ତର କରନ୍ତୁ'
+    }
+}
+
+DYNAMIC_LANG_MAP.update(INDIAN_LANGS)
+from other_langs import OTHER_LANGS
+DYNAMIC_LANG_MAP.update(OTHER_LANGS)
+
+INSTRUCTION_TRANSLATIONS = {
+    'es': {
+        'How to use our free': 'Cómo usar nuestra herramienta gratuita de',
+        'Frequently Asked Questions': 'Preguntas Frecuentes',
+        'Step 1': 'Paso 1',
+        'Step 2': 'Paso 2',
+        'Step 3': 'Paso 3',
+        'Step 4': 'Paso 4',
+        'Drag & Drop PDF files here': 'Arrastra y suelta archivos PDF aquí',
+        'or click to select multiple PDFs': 'o haz clic para seleccionar varios PDF',
+        'or click to select a PDF': 'o haz clic para seleccionar un PDF',
+        'Professional Online': 'Herramienta profesional en línea para',
+        'Guaranteed Security': 'Seguridad garantizada',
+        '100% Free & Unlimited': '100% Gratis e ilimitado',
+        'Download Processed File': 'Descargar archivo procesado',
+        'Process another document': 'Procesar otro documento',
+        'Back to Home page': 'Volver a la página principal',
+        'Back to all tools': 'Volver a todas las herramientas',
+        'Popular PDF Searches': 'Búsquedas populares de PDF'
+    },
+    'fr': {
+        'How to use our free': 'Comment utiliser notre outil gratuit de',
+        'Frequently Asked Questions': 'Foire aux Questions',
+        'Step 1': 'Étape 1',
+        'Step 2': 'Étape 2',
+        'Step 3': 'Étape 3',
+        'Step 4': 'Étape 4',
+        'Drag & Drop PDF files here': 'Glissez & déposez les fichiers PDF ici',
+        'or click to select multiple PDFs': 'ou cliquez pour sélectionner plusieurs PDF',
+        'or click to select a PDF': 'ou cliquez pour sélectionner un PDF',
+        'Professional Online': 'Outil professionnel en ligne pour',
+        'Guaranteed Security': 'Sécurité garantie',
+        '100% Free & Unlimited': '100% Gratuit & Illimité',
+        'Download Processed File': 'Télécharger le fichier traité',
+        'Process another document': 'Traiter un autre document',
+        'Back to Home page': 'Retour à l\'accueil',
+        'Back to all tools': 'Retour à tous les outils',
+        'Popular PDF Searches': 'Recherches PDF populaires'
+    },
+    'de': {
+        'How to use our free': 'So nutzen Sie unser kostenloses Werkzeug für',
+        'Frequently Asked Questions': 'Häufig gestellte Fragen',
+        'Step 1': 'Schritt 1',
+        'Step 2': 'Schritt 2',
+        'Step 3': 'Schritt 3',
+        'Step 4': 'Schritt 4',
+        'Drag & Drop PDF files here': 'PDF-Dateien hierher ziehen & ablegen',
+        'or click to select multiple PDFs': 'oder klicken Sie, um mehrere PDFs auszuwählen',
+        'or click to select a PDF': 'oder klicken Sie, um ein PDF auszuwählen',
+        'Professional Online': 'Professionelles Online-Werkzeug für',
+        'Guaranteed Security': 'Garantierte Sicherheit',
+        '100% Free & Unlimited': '100% Kostenlos & Unbegrenzt',
+        'Download Processed File': 'Verarbeitete Datei herunterladen',
+        'Process another document': 'Ein weiteres Dokument verarbeiten',
+        'Back to Home page': 'Zurück zur Startseite',
+        'Back to all tools': 'Zurück zu allen Werkzeugen',
+        'Popular PDF Searches': 'Beliebte PDF-Suchanfragen'
+    },
+    'pt': {
+        'How to use our free': 'Como usar nossa ferramenta gratuita de',
+        'Frequently Asked Questions': 'Perguntas Frequentes',
+        'Step 1': 'Passo 1',
+        'Step 2': 'Passo 2',
+        'Step 3': 'Passo 3',
+        'Step 4': 'Passo 4',
+        'Drag & Drop PDF files here': 'Arraste e solte arquivos PDF aqui',
+        'or click to select multiple PDFs': 'ou clique para selecionar vários PDFs',
+        'or click to select a PDF': 'ou clique para selecionar um PDF',
+        'Professional Online': 'Ferramenta online profissional de',
+        'Guaranteed Security': 'Segurança garantida',
+        '100% Free & Unlimited': '100% Grátis e ilimitado',
+        'Download Processed File': 'Baixar arquivo processado',
+        'Process another document': 'Processar outro documento',
+        'Back to Home page': 'Voltar para a página inicial',
+        'Back to all tools': 'Voltar para todas as ferramentas',
+        'Popular PDF Searches': 'Pesquisas populares de PDF'
+    },
+    'hi': {
+        'How to use our free': 'हमारे मुफ़्त टूल का उपयोग कैसे करें',
+        'Frequently Asked Questions': 'अक्सर पूछे जाने वाले प्रश्न',
+        'Step 1': 'चरण 1',
+        'Step 2': 'चरण 2',
+        'Step 3': 'चरण 3',
+        'Step 4': 'चरण 4',
+        'Drag & Drop PDF files here': 'अपनी PDF फ़ाइलें यहाँ खींचें और छोड़ें',
+        'or click to select multiple PDFs': 'या कई PDF चुनने के लिए क्लिक करें',
+        'or click to select a PDF': 'या PDF चुनने के लिए क्लिक करें',
+        'Professional Online': 'प्रोफेशनल ऑनलाइन टूल',
+        'Guaranteed Security': 'गारंटीकृत सुरक्षा',
+        '100% Free & Unlimited': '100% मुफ़्त और असीमित',
+        'Download Processed File': 'संसाधित फ़ाइल डाउनलोड करें',
+        'Process another document': 'दूसरा दस्तावेज़ प्रोसेस करें',
+        'Back to Home page': 'होम पेज पर वापस जाएं',
+        'Back to all tools': 'सभी टूल पर वापस जाएं',
+        'Popular PDF Searches': 'लोकप्रिय PDF खोजें'
+    },
+    'ar': {
+        'How to use our free': 'كيفية استخدام أداة المجانية',
+        'Frequently Asked Questions': 'الأسئلة الشائعة',
+        'Step 1': 'الخطوة 1',
+        'Step 2': 'الخطوة 2',
+        'Step 3': 'الخطوة 3',
+        'Step 4': 'الخطوة 4',
+        'Drag & Drop PDF files here': 'اسحب وأسقط ملفات PDF هنا',
+        'or click to select multiple PDFs': 'أو انقر لتحديد ملفات PDF متعددة',
+        'or click to select a PDF': 'أو انقر لتحديد ملف PDF',
+        'Professional Online': 'أداة احترافية عبر الإنترنت لـ',
+        'Guaranteed Security': 'أمان مضمون',
+        '100% Free & Unlimited': '100% مجاني وغير محدود',
+        'Download Processed File': 'تحميل الملف المعالج',
+        'Process another document': 'معالجة مستند آخر',
+        'Back to Home page': 'العودة إلى الصفحة الرئيسية',
+        'Back to all tools': 'العودة إلى جميع الأدوات',
+        'Popular PDF Searches': 'عمليات البحث الشائعة عن PDF'
+    },
+    'it': {
+        'How to use our free': 'Come usare il nostro strumento gratuito di',
+        'Frequently Asked Questions': 'Domande Frequenti',
+        'Step 1': 'Passaggio 1',
+        'Step 2': 'Passaggio 2',
+        'Step 3': 'Passaggio 3',
+        'Step 4': 'Passaggio 4',
+        'Drag & Drop PDF files here': 'Trascina e rilascia i file PDF qui',
+        'or click to select multiple PDFs': 'o clicca per selezionare più PDF',
+        'or click to select un PDF': 'o clicca per selezionare un PDF',
+        'Professional Online': 'Strumento online professionale per',
+        'Guaranteed Security': 'Sicurezza garantita',
+        '100% Free & Unlimited': '100% Gratuito e illimitato',
+        'Download Processed File': 'Scarica il file elaborato',
+        'Process another document': 'Elabora un altro documento',
+        'Back to Home page': 'Torna alla pagina iniziale',
+        'Back to all tools': 'Torna a tutti gli strumenti',
+        'Popular PDF Searches': 'Ricerche PDF popolari'
+    },
+    'ru': {
+        'How to use our free': 'Как использовать наш бесплатный инструмент',
+        'Frequently Asked Questions': 'Часто задаваемые вопросы',
+        'Step 1': 'Шаг 1',
+        'Step 2': 'Шаг 2',
+        'Step 3': 'Шаг 3',
+        'Step 4': 'Шаг 4',
+        'Drag & Drop PDF files here': 'Перетащите файлы PDF сюда',
+        'or click to select multiple PDFs': 'или нажмите, чтобы выбрать несколько PDF',
+        'or click to select a PDF': 'или нажмите, чтобы выбрать PDF',
+        'Professional Online': 'Профессиональный онлайн-инструмент для',
+        'Guaranteed Security': 'Гарантированная безопасность',
+        '100% Free & Unlimited': '100% Бесплатно и без ограничений',
+        'Download Processed File': 'Скачать обработанный файл',
+        'Process another document': 'Обработать другой документ',
+        'Back to Home page': 'Вернуться на главную страницу',
+        'Back to all tools': 'Вернуться ко всем инструментам',
+        'Popular PDF Searches': 'Популярные запросы PDF'
+    }
+}
+
+def apply_language_translations(html, lang):
+    # Fix relative CSS link injected by previous script so it works on nested routes like /es/merge
+    html = html.replace('href="./style.css', 'href="/style.css')
+    
+    if not lang or lang == 'en':
+        return html
+        
+    # Get base 2-letter language code (e.g., 'es-mx' -> 'es')
+    base_lang = lang.lower().split('-')[0]
+    
+    t_dict = DYNAMIC_LANG_MAP.get(base_lang)
+    if not t_dict:
+        return html
+        
+    # Localize internal links (href="/...")
+    langs_prefixes = tuple(f"{l}/" for l in SUPPORTED_LANGS)
+    static_prefixes = ('favicon', 'apple', 'site.webmanifest', 'logo', 'ad-', 'style.css', 'api/', 'download/') + langs_prefixes
+    html = re.sub(
+        r'href="/([^"]*)"', 
+        lambda m: f'href="/{lang}/{m.group(1)}"' if not m.group(1).startswith(static_prefixes) else m.group(0), 
+        html
+    )
+    
+    # Fix the English language switcher link which gets incorrectly prefixed
+    html = html.replace(f'<a href="/{lang}/">English</a>', '<a href="/">English</a>')
+    
+    # Localize inline JS navigation buttons (e.g., logo and Home buttons)
+    html = re.sub(
+        r'window\.location\.href=[\'"]\/[\'"]', 
+        f'window.location.href="/{lang}/"', 
+        html,
+        flags=re.IGNORECASE
+    )
+        
+    # Replace html lang tag
+    html = re.sub(r'''<html\s+lang=["'][^"']*["']''', f'<html lang="{lang}"', html, flags=re.IGNORECASE)
+    
+    # Replace Titles & Meta Descriptions
+    if 'title' in t_dict:
+        html = re.sub(r'<title>.*?</title>', f'<title>{t_dict["title"]}</title>', html, flags=re.DOTALL)
+    if 'desc' in t_dict:
+        html = re.sub(r'''<meta\s+name=["']description["']\s+content=["'][^"']*["']''', f'<meta name="description" content="{t_dict["desc"]}"', html, flags=re.IGNORECASE)
+        
+    # Replace Hero H1 & Subtitle
+    if 'h1' in t_dict:
+        html = html.replace('Every tool you need to work with PDFs in one place', t_dict['h1'])
+    if 'desc' in t_dict:
+        html = html.replace('Every tool you need to use PDFs, at your fingertips. All are 100% FREE and easy to use! Merge, split, compress, convert, rotate, unlock and watermark PDFs with just a few clicks.', t_dict['desc'])
+        
+    # Replace Navigation & Category Tabs & Tools Grid
+    replacements = [
+        ('Merge PDF', t_dict.get('merge', 'Merge PDF')),
+        ('Split PDF', t_dict.get('split', 'Split PDF')),
+        ('Compress PDF', t_dict.get('compress', 'Compress PDF')),
+        ('Word to PDF', t_dict.get('w2p', 'Word to PDF')),
+        ('PDF to Word', t_dict.get('p2w', 'PDF to Word')),
+        ('PDF to PowerPoint', t_dict.get('p2pp', 'PDF to PowerPoint')),
+        ('PDF to Excel', t_dict.get('p2ex', 'PDF to Excel')),
+        ('PowerPoint to PDF', t_dict.get('pp2p', 'PowerPoint to PDF')),
+        ('Excel to PDF', t_dict.get('ex2p', 'Excel to PDF')),
+        ('JPG to PDF', t_dict.get('j2p', 'JPG to PDF')),
+        ('PDF to JPG', t_dict.get('p2j', 'PDF to JPG')),
+        ('Rotate PDF', t_dict.get('rot', 'Rotate PDF')),
+        ('Protect PDF', t_dict.get('prot', 'Protect PDF')),
+        ('Unlock PDF', t_dict.get('unl', 'Unlock PDF')),
+        ('Watermark', t_dict.get('wm', 'Watermark')),
+        ('Page Numbers', t_dict.get('pn', 'Page Numbers')),
+        ('Organize PDF', t_dict.get('org', 'Organize PDF')),
+        ('HTML to PDF', t_dict.get('h2p', 'HTML to PDF')),
+        ('Extract Text', t_dict.get('txt', 'Extract Text')),
+        ('Delete Pages', t_dict.get('del', 'Delete Pages')),
+        ('PDF to PDF/A', t_dict.get('pdfa', 'PDF to PDF/A')),
+        ('Repair PDF', t_dict.get('rep', 'Repair PDF')),
+        ('OCR PDF', t_dict.get('ocr', 'OCR PDF')),
+        ('AI Summarizer', t_dict.get('ai', 'AI Summarizer')),
+        ('Translate PDF', t_dict.get('trans', 'Translate PDF')),
+        ('Sign PDF', t_dict.get('sign', 'Sign PDF')),
+        ('Compare PDF', t_dict.get('comp', 'Compare PDF')),
+        ('Log in', t_dict.get('login', 'Log in')),
+        ('Sign up', t_dict.get('signup', 'Sign up')),
+        ('Home', t_dict.get('home', 'Home')),
+        ('All PDF Tools', t_dict.get('all_tools', 'All PDF Tools')),
+        ('Convert PDF', t_dict.get('convert_pdf', 'Convert PDF'))
+    ]
+    
+    for old_str, new_str in replacements:
+        html = html.replace(old_str, new_str)
+        
+    inst_trans = INSTRUCTION_TRANSLATIONS.get(base_lang, {})
+    for english_phrase, translated_phrase in inst_trans.items():
+        html = html.replace(english_phrase, translated_phrase)
+        
+    # Advanced Regional SEO Schema Injection for Indian Languages
+    indian_langs = ['hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ur', 'pa', 'ml', 'or']
+    if base_lang in indian_langs:
+        schema = f"""<script type="application/ld+json">
+{{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "i loves pdfs",
+  "url": "https://ilovespdfs.in/{lang}/",
+  "inLanguage": "{lang}",
+  "description": "{t_dict.get('desc', '')}"
+}}
+</script>
+<script type="application/ld+json">
+{{
+  "@context": "https://schema.org",
+  "@type": "Service",
+  "name": "i loves pdfs",
+  "areaServed": "IN",
+  "description": "{t_dict.get('desc', '')}",
+  "url": "https://ilovespdfs.in/{lang}/"
+}}
+</script>"""
+        html = re.sub(r'</head>', schema + '\n</head>', html, flags=re.IGNORECASE)
+        
+    return html
